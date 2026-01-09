@@ -19,6 +19,41 @@ LOCAL_MINERU_API_BASE = os.getenv("LOCAL_MINERU_API_BASE", "http://localhost:808
 # 转换后文件的默认输出目录
 DEFAULT_OUTPUT_DIR = os.getenv("OUTPUT_DIR", "./downloads")
 
+# 通过 MCP 上传文件内容时的最大允许大小（字节）。
+# 由于 MCP tool 参数通常是 JSON（如 base64 字符串），过大的文件会导致内存与带宽压力。
+MAX_UPLOAD_BYTES = int(os.getenv("MINERU_MCP_MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
+
+# 本地文件路径解析的安全控制
+MCP_DISABLE_PATH_INPUT = os.getenv("MINERU_MCP_DISABLE_PATH_INPUT", "").lower() in [
+    "true",
+    "1",
+    "yes",
+]
+MCP_REQUIRE_PATH_ALLOWLIST = os.getenv(
+    "MINERU_MCP_REQUIRE_ALLOWLIST", ""
+).lower() in ["true", "1", "yes"]
+
+
+def _parse_allowed_roots(value: str) -> list[Path]:
+    if not value:
+        return []
+
+    roots: list[Path] = []
+    for chunk in value.split(os.pathsep):
+        for item in chunk.split(","):
+            item = item.strip()
+            if item:
+                roots.append(Path(item).expanduser())
+    return roots
+
+
+MCP_ALLOWED_INPUT_ROOTS = _parse_allowed_roots(
+    os.getenv("MINERU_MCP_ALLOWED_INPUT_ROOTS", "")
+)
+
+# 处理本地文件时的最大允许大小（字节）。
+MAX_FILE_BYTES = int(os.getenv("MINERU_MCP_MAX_FILE_BYTES", str(50 * 1024 * 1024)))
+
 
 # 设置日志系统
 def setup_logging():

@@ -1,8 +1,13 @@
 """MinerU File转Markdown转换的FastMCP服务器实现。"""
 
+import base64
+import binascii
 import json
+import secrets
+import shutil
 import re
 import traceback
+import mimetypes
 from pathlib import Path
 from typing import Annotated, Any, Dict, List, Optional
 
@@ -28,6 +33,7 @@ mcp = FastMCP(
 
     系统工具:
     parse_documents: 解析文档（支持本地文件和URL，自动读取内容）
+    parse_documents_base64: 解析通过base64上传的文件内容（远端场景适用）
     get_ocr_languages: 获取OCR支持的语言列表
     """,
 )
@@ -176,6 +182,145 @@ def parse_list_input(input_str: str) -> List[str]:
             result.append(item)
 
     return result
+
+
+def _estimate_base64_decoded_size(base64_payload: str) -> int:
+    """估算 base64 解码后的字节长度（不进行实际解码）。"""
+    if not base64_payload:
+        return 0
+
+    payload = base64_payload.strip()
+    if payload.startswith("data:") and "base64," in payload:
+        payload = payload.split("base64,", 1)[1]
+
+    payload = re.sub(r"\s+", "", payload)
+    padding = payload.count("=")
+    return max(0, (len(payload) * 3) // 4 - padding)
+
+
+def _decode_base64_payload(base64_payload: str) -> bytes:
+    """将 base64（可包含 data URL 前缀/空白）解码为 bytes。"""
+    if not base64_payload:
+        raise ValueError("content_base64 为空")
+
+    payload = base64_payload.strip()
+    if payload.startswith("data:") and "base64," in payload:
+        payload = payload.split("base64,", 1)[1]
+
+    payload = re.sub(r"\s+", "", payload)
+    try:
+        return base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise ValueError(f"base64 解码失败: {str(e)}") from e
+
+
+def _sanitize_upload_filename(filename: str) -> str:
+    """清理上传文件名，防止路径穿越，并避免空白/逗号导致的切分问题。"""
+    name = Path(filename or "").name
+    if not name:
+        return "upload.bin"
+    name = re.sub(r"[\s,]+", "_", name).strip("_")
+    return name or "upload.bin"
+
+
+def _build_results_response(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """将逐文件结果列表打包为 parse_documents 的统一返回格式。"""
+    if not results:
+        return {"status": "error", "error": "未处理任何文件"}
+
+    success_count = len([r for r in results if r.get("status") == "success"])
+    error_count = len([r for r in results if r.get("status") == "error"])
+    warning_count = len([r for r in results if r.get("status") == "warning"])
+    total_count = len(results)
+
+    # 只有一个结果时，直接返回该结果（保持向后兼容）
+    if total_count == 1:
+        result = results[0].copy()
+        if "filename" in result:
+            del result["filename"]
+        if "source_path" in result:
+            del result["source_path"]
+        if "source_url" in result:
+            del result["source_url"]
+        return result
+
+    overall_status = "success"
+    if success_count == 0 and (error_count > 0):
+        overall_status = "error"
+    elif success_count == 0 and warning_count > 0:
+        overall_status = "warning"
+    elif error_count > 0 or warning_count > 0:
+        overall_status = "partial_success"
+
+    return {
+        "status": overall_status,
+        "results": results,
+        "summary": {
+            "total_files": total_count,
+            "success_count": success_count,
+            "error_count": error_count,
+            "warning_count": warning_count,
+        },
+    }
+
+
+def _is_path_allowed(path: Path, extra_roots: Optional[List[Path]] = None) -> bool:
+    roots = list(config.MCP_ALLOWED_INPUT_ROOTS)
+    if extra_roots:
+        roots.extend(extra_roots)
+
+    if not roots:
+        return not config.MCP_REQUIRE_PATH_ALLOWLIST
+
+    try:
+        resolved_path = path.resolve()
+    except Exception:
+        return False
+
+    for root in roots:
+        try:
+            resolved_root = root.expanduser().resolve()
+        except Exception:
+            continue
+        try:
+            if resolved_path.is_relative_to(resolved_root):
+                return True
+        except AttributeError:
+            # 兼容旧版本 Path，保留可读性
+            if str(resolved_path).startswith(str(resolved_root)):
+                return True
+    return False
+
+
+def _validate_local_path(
+    path: Path,
+    *,
+    extra_roots: Optional[List[Path]] = None,
+    allow_when_disabled: bool = False,
+) -> Optional[str]:
+    if config.MCP_DISABLE_PATH_INPUT and not allow_when_disabled:
+        return "当前服务已禁用本地路径输入"
+
+    if config.MCP_REQUIRE_PATH_ALLOWLIST and not (
+        config.MCP_ALLOWED_INPUT_ROOTS or extra_roots
+    ):
+        return "当前服务要求设置允许目录（MINERU_MCP_ALLOWED_INPUT_ROOTS）"
+
+    if not _is_path_allowed(path, extra_roots=extra_roots):
+        return "文件路径不在允许目录内"
+
+    if config.MAX_FILE_BYTES > 0:
+        try:
+            size = path.stat().st_size
+        except Exception as e:
+            return f"无法读取文件大小: {str(e)}"
+        if size > config.MAX_FILE_BYTES:
+            return (
+                f"文件过大: {size} bytes，超过限制 {config.MAX_FILE_BYTES} bytes；"
+                "可通过 MINERU_MCP_MAX_FILE_BYTES 调整"
+            )
+
+    return None
 
 
 async def convert_file_url(
@@ -765,9 +910,34 @@ async def parse_documents(
             f"检测到重复路径，已自动去重: {original_count} -> {unique_count}"
         )
 
+    results = await _parse_documents_from_sources_list(
+        sources,
+        enable_ocr=enable_ocr,
+        language=language,
+        page_ranges=page_ranges,
+    )
+    return _build_results_response(results)
+
+
+async def _parse_documents_from_sources_list(
+    sources: List[str],
+    *,
+    enable_ocr: bool,
+    language: str,
+    page_ranges: str | None,
+    extra_allowed_roots: Optional[List[Path]] = None,
+    allow_paths_when_disabled: bool = False,
+) -> List[Dict[str, Any]]:
+    """复用 parse_documents 的逻辑，但输入为已解析好的 sources 列表。"""
+    if not sources:
+        return []
+
+    # 去重处理，使用字典来保持原始顺序
+    sources = list(dict.fromkeys(sources))
+
     # 将路径分类
-    url_paths = []
-    file_paths = []
+    url_paths: List[str] = []
+    file_paths: List[str] = []
 
     for source in sources:
         if source.lower().startswith(("http://", "https://")):
@@ -775,27 +945,34 @@ async def parse_documents(
         else:
             file_paths.append(source)
 
-    results = []
+    results: List[Dict[str, Any]] = []
 
-    # 根据USE_LOCAL_API决定处理方式
-    if config.USE_LOCAL_API:
-        # 在本地API模式下，只处理本地文件路径
-        if not file_paths:
-            return {
-                "status": "warning",
-                "message": "在本地API模式下，无法处理URL，且未提供有效的本地文件路径",
+    if config.MCP_DISABLE_PATH_INPUT and file_paths and not allow_paths_when_disabled:
+        return [
+            {
+                "status": "error",
+                "error": "当前服务已禁用本地路径输入",
             }
+        ]
+
+    if config.USE_LOCAL_API:
+        if not file_paths:
+            return [
+                {
+                    "status": "warning",
+                    "message": "在本地API模式下，无法处理URL，且未提供有效的本地文件路径",
+                }
+            ]
 
         config.logger.info(f"使用本地API处理 {len(file_paths)} 个文件")
 
-        # 逐个处理本地文件
         for path in file_paths:
             try:
-                # 跳过不存在的文件
-                if not Path(path).exists():
+                path_obj = Path(path)
+                if not path_obj.exists():
                     results.append(
                         {
-                            "filename": Path(path).name,
+                            "filename": path_obj.name,
                             "source_path": path,
                             "status": "error",
                             "error_message": f"文件不存在: {path}",
@@ -803,181 +980,280 @@ async def parse_documents(
                     )
                     continue
 
+                validation_error = _validate_local_path(
+                    path_obj,
+                    extra_roots=extra_allowed_roots,
+                    allow_when_disabled=allow_paths_when_disabled,
+                )
+                if validation_error:
+                    results.append(
+                        {
+                            "filename": path_obj.name,
+                            "source_path": path,
+                            "status": "error",
+                            "error_message": validation_error,
+                        }
+                    )
+                    continue
+
                 result = await local_parse_file(
                     file_path=path,
-                    parse_method=(
-                        "ocr" if enable_ocr else "txt"
-                    ),  # 如果启用OCR，使用ocr，否则使用txt
+                    parse_method=("ocr" if enable_ocr else "txt"),
                 )
 
-                # 添加文件名信息
-                result_with_filename = {
-                    "filename": Path(path).name,
-                    "source_path": path,
-                    **result,
-                }
-                results.append(result_with_filename)
-
+                results.append(
+                    {
+                        "filename": path_obj.name,
+                        "source_path": path,
+                        **result,
+                    }
+                )
             except Exception as e:
-                # 处理文件时出现异常，记录错误但继续处理下一个文件
                 config.logger.error(f"处理文件 {path} 时出现错误: {str(e)}")
                 results.append(
                     {
-                        "filename": Path(path).name,
+                        "filename": path_obj.name,
                         "source_path": path,
                         "status": "error",
                         "error_message": f"处理文件时出现异常: {str(e)}",
                     }
                 )
 
-    else:
-        # 在远程API模式下，分别处理URL和本地文件路径
-        if url_paths:
-            config.logger.info(f"使用远程API处理 {len(url_paths)} 个文件URL")
+        return results
 
-            try:
-                # 调用convert_file_url处理URLs
-                url_result = await convert_file_url(
-                    url=",".join(url_paths),
-                    enable_ocr=enable_ocr,
-                    language=language,
-                    page_ranges=page_ranges,
-                )
+    # 远程API模式下，分别处理URL和本地文件路径
+    if url_paths:
+        config.logger.info(f"使用远程API处理 {len(url_paths)} 个文件URL")
+        try:
+            url_configs = [{"url": u, "is_ocr": enable_ocr} for u in url_paths]
+            url_result = await convert_file_url(
+                url=url_configs,
+                enable_ocr=enable_ocr,
+                language=language,
+                page_ranges=page_ranges,
+            )
 
-                if url_result["status"] == "success":
-                    # 为每个URL生成对应的结果
-                    for url in url_paths:
-                        result_item = await _process_conversion_result(
-                            url_result, url, is_url=True
-                        )
-                        results.append(result_item)
-                else:
-                    # 转换失败，为所有URL添加错误结果
-                    for url in url_paths:
-                        results.append(
-                            {
-                                "filename": url.split("/")[-1].split("?")[0],
-                                "source_url": url,
-                                "status": "error",
-                                "error_message": url_result.get("error", "URL处理失败"),
-                            }
-                        )
-
-            except Exception as e:
-                config.logger.error(f"处理URL时出现错误: {str(e)}")
+            if url_result["status"] == "success":
+                for url in url_paths:
+                    result_item = await _process_conversion_result(
+                        url_result, url, is_url=True
+                    )
+                    results.append(result_item)
+            else:
                 for url in url_paths:
                     results.append(
                         {
                             "filename": url.split("/")[-1].split("?")[0],
                             "source_url": url,
                             "status": "error",
-                            "error_message": f"处理URL时出现异常: {str(e)}",
+                            "error_message": url_result.get("error", "URL处理失败"),
                         }
                     )
+        except Exception as e:
+            config.logger.error(f"处理URL时出现错误: {str(e)}")
+            for url in url_paths:
+                results.append(
+                    {
+                        "filename": url.split("/")[-1].split("?")[0],
+                        "source_url": url,
+                        "status": "error",
+                        "error_message": f"处理URL时出现异常: {str(e)}",
+                    }
+                )
 
-        if file_paths:
-            config.logger.info(f"使用远程API处理 {len(file_paths)} 个本地文件")
+    if file_paths:
+        config.logger.info(f"使用远程API处理 {len(file_paths)} 个本地文件")
 
-            # 过滤出存在的文件
-            existing_files = []
-            for file_path in file_paths:
-                if not Path(file_path).exists():
+        existing_files: List[str] = []
+        for file_path in file_paths:
+            path_obj = Path(file_path)
+            if not path_obj.exists():
+                results.append(
+                    {
+                        "filename": path_obj.name,
+                        "source_path": file_path,
+                        "status": "error",
+                        "error_message": f"文件不存在: {file_path}",
+                    }
+                )
+            else:
+                validation_error = _validate_local_path(
+                    path_obj,
+                    extra_roots=extra_allowed_roots,
+                    allow_when_disabled=allow_paths_when_disabled,
+                )
+                if validation_error:
                     results.append(
                         {
-                            "filename": Path(file_path).name,
+                            "filename": path_obj.name,
                             "source_path": file_path,
                             "status": "error",
-                            "error_message": f"文件不存在: {file_path}",
+                            "error_message": validation_error,
                         }
                     )
                 else:
                     existing_files.append(file_path)
 
-            if existing_files:
-                try:
-                    # 调用convert_file_path处理本地文件
-                    file_result = await convert_file_path(
-                        file_path=",".join(existing_files),
-                        enable_ocr=enable_ocr,
-                        language=language,
-                        page_ranges=page_ranges,
-                    )
+        if existing_files:
+            try:
+                file_configs = [{"path": p, "is_ocr": enable_ocr} for p in existing_files]
+                file_result = await convert_file_path(
+                    file_path=file_configs,
+                    enable_ocr=enable_ocr,
+                    language=language,
+                    page_ranges=page_ranges,
+                )
 
-                    config.logger.debug(f"file_result: {file_result}")
-
-                    if file_result["status"] == "success":
-                        # 为每个文件生成对应的结果
-                        for file_path in existing_files:
-                            result_item = await _process_conversion_result(
-                                file_result, file_path, is_url=False
-                            )
-                            results.append(result_item)
-                    else:
-                        # 转换失败，为所有文件添加错误结果
-                        for file_path in existing_files:
-                            results.append(
-                                {
-                                    "filename": Path(file_path).name,
-                                    "source_path": file_path,
-                                    "status": "error",
-                                    "error_message": file_result.get(
-                                        "error", "文件处理失败"
-                                    ),
-                                }
-                            )
-
-                except Exception as e:
-                    config.logger.error(f"处理本地文件时出现错误: {str(e)}")
+                if file_result["status"] == "success":
+                    for file_path in existing_files:
+                        result_item = await _process_conversion_result(
+                            file_result, file_path, is_url=False
+                        )
+                        results.append(result_item)
+                else:
                     for file_path in existing_files:
                         results.append(
                             {
                                 "filename": Path(file_path).name,
                                 "source_path": file_path,
                                 "status": "error",
-                                "error_message": f"处理文件时出现异常: {str(e)}",
+                                "error_message": file_result.get(
+                                    "error", "文件处理失败"
+                                ),
                             }
                         )
+            except Exception as e:
+                config.logger.error(f"处理本地文件时出现错误: {str(e)}")
+                for file_path in existing_files:
+                    results.append(
+                        {
+                            "filename": Path(file_path).name,
+                            "source_path": file_path,
+                            "status": "error",
+                            "error_message": f"处理文件时出现异常: {str(e)}",
+                        }
+                    )
 
-    # 处理结果为空的情况
-    if not results:
-        return {"status": "error", "error": "未处理任何文件"}
+    return results
 
-    # 计算成功和失败的统计信息
-    success_count = len([r for r in results if r.get("status") == "success"])
-    error_count = len([r for r in results if r.get("status") == "error"])
-    total_count = len(results)
 
-    # 只有一个结果时，直接返回该结果（保持向后兼容）
-    if len(results) == 1:
-        result = results[0].copy()
-        # 为了向后兼容，移除新增的字段
-        if "filename" in result:
-            del result["filename"]
-        if "source_path" in result:
-            del result["source_path"]
-        if "source_url" in result:
-            del result["source_url"]
-        return result
+@mcp.tool()
+async def parse_documents_base64(
+    files: Annotated[
+        List[Dict[str, Any]],
+        Field(
+            description=(
+                "通过 base64 上传文件内容并解析（适用于远端 MCP Server 场景）。\n"
+                "格式：[{\"filename\": \"a.pdf\", \"content_base64\": \"...\"}, ...]\n"
+                "content_base64 支持 data URL 前缀（data:...;base64,xxxx）。"
+            )
+        ),
+    ],
+    enable_ocr: Annotated[bool, Field(description="启用OCR识别,默认False")] = False,
+    language: Annotated[
+        str, Field(description='文档语言，默认"ch"中文，可选"en"英文等')
+    ] = "ch",
+    page_ranges: Annotated[
+        str | None,
+        Field(
+            description='指定页码范围（远程API），格式例如 "2,4-6" 或 "2--2"，默认None'
+        ),
+    ] = None,
+    keep_uploaded_files: Annotated[
+        bool,
+        Field(
+            description=(
+                "是否保留服务端落盘的上传文件（默认False）。"
+                "开启后便于排查问题，但注意磁盘占用。"
+            )
+        ),
+    ] = False,
+) -> Dict[str, Any]:
+    """
+    将 base64 写入服务端临时文件，然后复用 parse_documents 的解析逻辑。
+    """
+    if not files:
+        return {"status": "error", "error": "files 不能为空"}
 
-    # 多个结果时，返回详细的结果列表
-    # 根据成功/失败情况决定整体状态
-    overall_status = "success"
-    if success_count == 0:
-        # 所有文件都失败
-        overall_status = "error"
-    elif error_count > 0:
-        # 有部分文件失败，但不是全部
-        overall_status = "partial_success"
+    # 在输出目录下创建一次上传会话目录（避免与解析输出目录混淆）
+    base_output = config.ensure_output_dir(output_dir)
+    upload_dir = base_output / "_uploads" / secrets.token_hex(12)
+    upload_dir.mkdir(parents=True, exist_ok=True)
 
-    return {
-        "status": overall_status,
-        "results": results,
-        "summary": {
-            "total_files": total_count,
-            "success_count": success_count,
-            "error_count": error_count,
-        },
-    }
+    saved_sources: List[str] = []
+    pre_results: List[Dict[str, Any]] = []
+
+    try:
+        for i, item in enumerate(files):
+            if not isinstance(item, dict):
+                pre_results.append(
+                    {
+                        "filename": f"upload_{i}",
+                        "status": "error",
+                        "error_message": "files 的每一项必须是对象",
+                    }
+                )
+                continue
+
+            safe_name = _sanitize_upload_filename(str(item.get("filename", "")))
+            content_b64 = item.get("content_base64")
+            if not isinstance(content_b64, str):
+                pre_results.append(
+                    {
+                        "filename": safe_name,
+                        "status": "error",
+                        "error_message": "缺少 content_base64 或类型不是字符串",
+                    }
+                )
+                continue
+
+            try:
+                estimated_size = _estimate_base64_decoded_size(content_b64)
+                if estimated_size > config.MAX_UPLOAD_BYTES:
+                    raise ValueError(
+                        f"文件过大: 估算 {estimated_size} bytes，超过限制 {config.MAX_UPLOAD_BYTES} bytes；"
+                        "可通过 MINERU_MCP_MAX_UPLOAD_BYTES 调整"
+                    )
+
+                data = _decode_base64_payload(content_b64)
+                if len(data) > config.MAX_UPLOAD_BYTES:
+                    raise ValueError(
+                        f"文件过大: {len(data)} bytes，超过限制 {config.MAX_UPLOAD_BYTES} bytes；"
+                        "可通过 MINERU_MCP_MAX_UPLOAD_BYTES 调整"
+                    )
+
+                # 为每个文件创建独立子目录，避免重名覆盖且保留原始文件名
+                subdir = upload_dir / f"{i:03d}"
+                subdir.mkdir(parents=True, exist_ok=True)
+                dest = subdir / safe_name
+                dest.write_bytes(data)
+                saved_sources.append(str(dest))
+            except Exception as e:
+                pre_results.append(
+                    {
+                        "filename": safe_name,
+                        "status": "error",
+                        "error_message": str(e),
+                    }
+                )
+
+        # 解析成功落盘的文件（即使为空也允许继续，以便返回 pre_results）
+        parsed_results: List[Dict[str, Any]] = []
+        if saved_sources:
+            parsed_results = await _parse_documents_from_sources_list(
+                saved_sources,
+                enable_ocr=enable_ocr,
+                language=language,
+                page_ranges=page_ranges,
+                extra_allowed_roots=[upload_dir],
+                allow_paths_when_disabled=True,
+            )
+
+        combined = pre_results + parsed_results
+        return _build_results_response(combined)
+    finally:
+        if not keep_uploaded_files:
+            shutil.rmtree(upload_dir, ignore_errors=True)
 
 
 @mcp.tool()
@@ -1024,10 +1300,16 @@ async def _parse_file_local(
         file_data = f.read()
 
     # 准备用于上传文件的表单数据
-    file_type = file_path_obj.suffix.lower()
+    guessed_mime, _ = mimetypes.guess_type(file_path_obj.name)
+    content_type = guessed_mime or "application/octet-stream"
     form_data = aiohttp.FormData()
     form_data.add_field(
-        "file", file_data, filename=file_path_obj.name, content_type=file_type
+        # MinerU 本地 API 通常使用 FastAPI 的 `files: List[UploadFile] = File(...)`
+        # 因此字段名应为 `files`（即便只上传一个文件也要用该字段名）。
+        "files",
+        file_data,
+        filename=file_path_obj.name,
+        content_type=content_type,
     )
     form_data.add_field("parse_method", parse_method)
 
