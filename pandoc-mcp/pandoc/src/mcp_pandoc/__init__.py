@@ -1,12 +1,9 @@
 """mcp_pandoc package initialization."""
-import asyncio
-
+from . import config
 from . import server
+from .cli import main
 
-
-def main():
-    """Run the mcp-pandoc server."""
-    asyncio.run(server.main())
+__version__ = "0.9.0"
 
 # Optionally expose other important items at package level
-__all__ = ['main', 'server']
+__all__ = ['main', 'server', 'config', '__version__']

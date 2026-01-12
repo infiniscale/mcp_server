@@ -1,0 +1,147 @@
+# Pandoc MCP Server - Docker Compose Configuration
+#
+# Usage:
+#   # 使用默认配置启动（端口 20000）
+#   docker-compose up -d
+#
+#   # 使用自定义端口启动
+#   MCP_PORT=30000 docker-compose up -d
+#
+#   # 启动带 PDF 支持的版本（包含 TeX Live，镜像较大）
+#   docker-compose --profile pdf up -d
+#
+#   # 查看日志
+#   docker-compose logs -f
+#
+#   # 停止服务
+#   docker-compose down
+
+version: '3.8'
+
+services:
+  # ============================================
+  # 标准版本（不含 PDF 支持，镜像较小）
+  # ============================================
+  mcp-pandoc:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    image: mcp-pandoc:latest
+    container_name: mcp-pandoc
+    restart: unless-stopped
+
+    # 端口映射 - 可通过环境变量 MCP_PORT 自定义
+    ports:
+      - "${MCP_PORT:-20000}:8001"
+
+    # 环境变量配置
+    environment:
+      # 日志级别: DEBUG, INFO, WARNING, ERROR
+      - PANDOC_LOG_LEVEL=${PANDOC_LOG_LEVEL:-INFO}
+
+      # 安全设置 - 远程部署建议保持 true
+      - PANDOC_MCP_DISABLE_PATH_INPUT=${PANDOC_MCP_DISABLE_PATH_INPUT:-true}
+      - PANDOC_MCP_DISABLE_FILTERS=${PANDOC_MCP_DISABLE_FILTERS:-true}
+
+      # 文件大小限制
+      - PANDOC_MCP_MAX_UPLOAD_BYTES=${PANDOC_MCP_MAX_UPLOAD_BYTES:-52428800}
+      - PANDOC_MCP_MAX_FILE_BYTES=${PANDOC_MCP_MAX_FILE_BYTES:-104857600}
+      - PANDOC_MCP_MAX_UPLOAD_FILES=${PANDOC_MCP_MAX_UPLOAD_FILES:-10}
+      - PANDOC_MCP_MAX_TOTAL_UPLOAD_BYTES=${PANDOC_MCP_MAX_TOTAL_UPLOAD_BYTES:-104857600}
+
+    # 数据卷 - 持久化输出文件（可选）
+    volumes:
+      - pandoc-output:/app/output
+      - pandoc-temp:/app/temp
+
+    # 资源限制
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/mcp', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+    # 日志配置
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ============================================
+  # PDF 支持版本（包含 TeX Live，镜像约 2GB）
+  # 使用: docker-compose --profile pdf up -d
+  # ============================================
+  mcp-pandoc-pdf:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production-pdf
+    image: mcp-pandoc:pdf
+    container_name: mcp-pandoc-pdf
+    restart: unless-stopped
+    profiles:
+      - pdf
+
+    ports:
+      - "${MCP_PORT:-20000}:8001"
+
+    environment:
+      - PANDOC_LOG_LEVEL=${PANDOC_LOG_LEVEL:-INFO}
+      - PANDOC_MCP_DISABLE_PATH_INPUT=${PANDOC_MCP_DISABLE_PATH_INPUT:-true}
+      - PANDOC_MCP_DISABLE_FILTERS=${PANDOC_MCP_DISABLE_FILTERS:-true}
+      - PANDOC_MCP_MAX_UPLOAD_BYTES=${PANDOC_MCP_MAX_UPLOAD_BYTES:-52428800}
+      - PANDOC_MCP_MAX_FILE_BYTES=${PANDOC_MCP_MAX_FILE_BYTES:-104857600}
+      - PANDOC_MCP_MAX_UPLOAD_FILES=${PANDOC_MCP_MAX_UPLOAD_FILES:-10}
+      - PANDOC_MCP_MAX_TOTAL_UPLOAD_BYTES=${PANDOC_MCP_MAX_TOTAL_UPLOAD_BYTES:-104857600}
+
+    volumes:
+      - pandoc-output:/app/output
+      - pandoc-temp:/app/temp
+
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 4G
+        reservations:
+          cpus: '1'
+          memory: 512M
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/mcp', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# 数据卷定义
+volumes:
+  pandoc-output:
+    driver: local
+  pandoc-temp:
+    driver: local
+
+# 网络定义（可选，用于多服务通信）
+networks:
+  default:
+    name: mcp-network
+    driver: bridge

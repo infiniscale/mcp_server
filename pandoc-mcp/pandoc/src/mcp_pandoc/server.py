@@ -1,5 +1,20 @@
-"""mcp-pandoc server module."""
+"""mcp-pandoc server module.
+
+Enhanced version with support for:
+- Original stdio mode
+- HTTP modes (sse, streamable-http)
+- Base64 file upload for remote scenarios
+- Security features (file size limits, path validation)
+"""
+
+import base64
+import binascii
 import os
+import re
+import secrets
+import shutil
+from pathlib import Path
+from typing import Any, Optional
 
 import mcp.server.stdio
 import mcp.types as types
@@ -8,184 +23,367 @@ import yaml
 from mcp.server import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
 
+from . import config
+
+# Initialize server
 server = Server("mcp-pandoc")
 
+# Global output directory (can be set via CLI)
+_output_dir: str = config.DEFAULT_OUTPUT_DIR
 
-@server.list_tools()
-async def handle_list_tools() -> list[types.Tool]:
-    """List available tools.
+# Format mapping for Pandoc
+FORMAT_ALIASES = {
+    "txt": "plain",  # Pandoc uses 'plain' for plain text output
+}
 
-    Each tool specifies its arguments using JSON Schema validation.
+INPUT_FORMAT_ALIASES = {
+    "txt": "markdown",  # Treat txt as markdown for input
+    "tex": "latex",
+}
+
+# MIME types for output formats
+MIME_TYPES = {
+    "pdf": "application/pdf",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "epub": "application/epub+zip",
+    "odt": "application/vnd.oasis.opendocument.text",
+    "ipynb": "application/x-ipynb+json",
+}
+
+# Binary formats that should be returned as base64
+# Note: ipynb is JSON text, not binary
+BINARY_FORMATS = {"pdf", "docx", "epub", "odt"}
+
+
+def set_output_dir(dir_path: str) -> str:
+    """Set the output directory for converted files.
+
+    Args:
+        dir_path: Path to the output directory
+
+    Returns:
+        The configured output directory path
     """
-    return [
-        types.Tool(
-            name="convert-contents",
-            description=(
-                "Converts content between different formats. Transforms input content from any supported format "
-                "into the specified output format.\n\n"
-                "🚨 CRITICAL REQUIREMENTS - PLEASE READ:\n"
-                "1. PDF Conversion:\n"
-                "   * You MUST install TeX Live BEFORE attempting PDF conversion:\n"
-                "   * Ubuntu/Debian: `sudo apt-get install texlive-xetex`\n"
-                "   * macOS: `brew install texlive`\n"
-                "   * Windows: Install MiKTeX or TeX Live from https://miktex.org/ or https://tug.org/texlive/\n"
-                "   * PDF conversion will FAIL without this installation\n\n"
-                "2. File Paths - EXPLICIT REQUIREMENTS:\n"
-                "   * When asked to save or convert to a file, you MUST provide:\n"
-                "     - Complete directory path\n"
-                "     - Filename\n"
-                "     - File extension\n"
-                "   * Example request: 'Write a story and save as PDF'\n"
-                "   * You MUST specify: '/path/to/story.pdf' or 'C:\\Documents\\story.pdf'\n"
-                "   * The tool will NOT automatically generate filenames or extensions\n\n"
-                "3. File Location After Conversion:\n"
-                "   * After successful conversion, the tool will display the exact path where the file is saved\n"
-                "   * Look for message: 'Content successfully converted and saved to: [file_path]'\n"
-                "   * You can find your converted file at the specified location\n"
-                "   * If no path is specified, files may be saved in system temp directory (/tmp/ on Unix systems)\n"
-                "   * For better control, always provide explicit output file paths\n\n"
-                "Supported formats:"
-                "- Basic: txt, html, markdown, ipynb, odt"
-                "- Advanced (REQUIRE complete file paths): pdf, docx, rst, latex, epub"
-                "✅ CORRECT Usage Examples:\n"
-                "1. 'Convert this text to HTML' (basic conversion)\n"
-                "   - Tool will show converted content\n\n"
-                "2. 'Save this text as PDF at /documents/story.pdf'\n"
-                "   - Correct: specifies path + filename + extension\n"
-                "   - Tool will show: 'Content successfully converted and saved to: /documents/story.pdf'\n\n"
-                "❌ INCORRECT Usage Examples:\n"
-                "1. 'Save this as PDF in /documents/'\n"
-                "   - Missing filename and extension\n"
-                "2. 'Convert to PDF'\n"
-                "   - Missing complete file path\n\n"
-                "When requesting conversion, ALWAYS specify:\n"
-                "1. The content or input file\n"
-                "2. The desired output format\n"
-                "3. For advanced formats: complete output path + filename + extension\n"
-                "Example: 'Convert this markdown to PDF and save as /path/to/output.pdf'\n\n"
-                "🎨 DOCX STYLING (NEW FEATURE):\n"
-                "4. Custom DOCX Styling with Reference Documents:\n"
-                "   * Use reference_doc parameter to apply professional styling to DOCX output\n"
-                "   * Create custom templates with your branding, fonts, and formatting\n"
-                "   * Perfect for corporate reports, academic papers, and professional documents\n"
-                "   * Example: 'Convert this report to DOCX using /templates/corporate-style.docx as reference "
-                "and save as /reports/Q4-report.docx'\n\n"
-                "🎯 PANDOC FILTERS (NEW FEATURE):\n"
-                "5. Pandoc Filter Support:\n"
-                "   * Use filters parameter to apply custom Pandoc filters during conversion\n"
-                "   * Filters are Python scripts that modify document content during processing\n"
-                "   * Perfect for Mermaid diagram conversion, custom styling, and content transformation\n"
-                "   * Example: 'Convert this markdown with mermaid diagrams to DOCX using "
-                "filters=[\"./filters/mermaid-to-png-vibrant.py\"] and save as /reports/diagram-report.docx'\n\n"
-                "📋 Creating Reference Documents:\n"
-                "   * Generate template: pandoc -o template.docx --print-default-data-file reference.docx\n"
-                "   * Customize in Word/LibreOffice: fonts, colors, headers, margins\n"
-                "   * Use for consistent branding across all documents\n\n"
-                "📋 Filter Requirements:\n"
-                "   * Filters must be executable Python scripts\n"
-                "   * Use absolute paths or paths relative to current working directory\n"
-                "   * Filters are applied in the order specified\n"
-                "   * Common filters: mermaid conversion, color processing, table formatting\n\n"
-                "📄 Defaults File Support (NEW FEATURE):\n"
-                "7. Pandoc Defaults File Support:\n"
-                "   * Use defaults_file parameter to specify a YAML configuration file\n"
-                "   * Similar to using pandoc -d option in the command line\n"
-                "   * Allows setting multiple options in a single file\n"
-                "   * Options in the defaults file can include filters, reference-doc, and other Pandoc options\n"
-                "   * Example: 'Convert this markdown to DOCX using defaults_file=\"/path/to/defaults.yaml\" "
-                "and save as /reports/report.docx'\n\n"
-                "Note: After conversion, always check the success message for the exact file location."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "contents": {
-                        "type": "string",
-                        "description": "The content to be converted (required if input_file not provided)"
-                    },
-                    "input_file": {
-                        "type": "string",
-                        "description": (
-                            "Complete path to input file including filename and extension "
-                            "(e.g., '/path/to/input.md')"
-                        )
-                    },
-                    "input_format": {
-                        "type": "string",
-                        "description": "Source format of the content (defaults to markdown)",
-                        "default": "markdown",
-                        "enum": ["markdown", "html", "pdf", "docx", "rst", "latex", "epub", "txt", "ipynb", "odt"]
-                    },
-                    "output_format": {
-                        "type": "string",
-                        "description": "Desired output format (defaults to markdown)",
-                        "default": "markdown",
-                        "enum": ["markdown", "html", "pdf", "docx", "rst", "latex", "epub", "txt", "ipynb", "odt"]
-                    },
-                    "output_file": {
-                        "type": "string",
-                        "description": (
-                            "Complete path where to save the output including filename and extension "
-                            "(required for pdf, docx, rst, latex, epub formats)"
-                        )
-                    },
-                    "reference_doc": {
-                        "type": "string",
-                        "description": (
-                            "Path to a reference document to use for styling "
-                            "(supported for docx output format)"
-                        )
-                    },
-                    "filters": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": (
-                            "List of Pandoc filter paths to apply during conversion. "
-                            "Filters are applied in the order specified."
-                        )
-                    },
-                    "defaults_file": {
-                        "type": "string",
-                        "description": (
-                            "Path to a Pandoc defaults file (YAML) containing conversion options. "
-                            "Similar to using pandoc -d option."
-                        )
-                    }
-                },
-                "additionalProperties": False
-            },
-        )
-    ]
+    global _output_dir
+    _output_dir = dir_path
+    config.ensure_output_dir(_output_dir)
+    return _output_dir
 
-@server.call_tool()
-async def handle_call_tool(
-    name: str, arguments: dict | None
-) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
-    """Handle tool execution requests.
 
-    Tools can modify server state and notify clients of changes.
+def get_output_dir() -> str:
+    """Get the current output directory.
+
+    Returns:
+        Current output directory path
     """
-    if name not in ["convert-contents"]:
-        raise ValueError(f"Unknown tool: {name}")
+    return _output_dir
 
-    print(arguments)
 
-    if not arguments:
-        raise ValueError("Missing arguments")
+# === Security Utility Functions ===
 
-    # Extract all possible arguments
-    contents = arguments.get("contents")
-    input_file = arguments.get("input_file")
-    output_file = arguments.get("output_file")
-    output_format = arguments.get("output_format", "markdown").lower()
-    input_format = arguments.get("input_format", "markdown").lower()
-    reference_doc = arguments.get("reference_doc")
-    filters = arguments.get("filters", [])
-    defaults_file = arguments.get("defaults_file")
+
+def _decode_base64_payload(base64_payload: str) -> bytes:
+    """Decode base64 content, supporting data URL prefix.
+
+    Args:
+        base64_payload: Base64 encoded string, optionally with data URL prefix
+
+    Returns:
+        Decoded bytes
+
+    Raises:
+        ValueError: If decoding fails or payload is empty
+    """
+    if not base64_payload:
+        raise ValueError("content_base64 is empty")
+
+    payload = base64_payload.strip()
+
+    # Remove data URL prefix if present (e.g., data:application/pdf;base64,)
+    if payload.startswith("data:") and "base64," in payload:
+        payload = payload.split("base64,", 1)[1]
+
+    # Remove all whitespace characters
+    payload = re.sub(r"\s+", "", payload)
+
+    try:
+        return base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise ValueError(f"Base64 decode failed: {str(e)}") from e
+
+
+def _encode_base64(data: bytes) -> str:
+    """Encode bytes to base64 string.
+
+    Args:
+        data: Bytes to encode
+
+    Returns:
+        Base64 encoded string
+    """
+    return base64.b64encode(data).decode("ascii")
+
+
+def _sanitize_filename(filename: str) -> str:
+    """Sanitize filename to prevent path traversal attacks.
+
+    Args:
+        filename: Original filename
+
+    Returns:
+        Sanitized filename safe for use
+    """
+    # Extract only the filename part, remove any path components
+    name = Path(filename or "").name
+    if not name:
+        return "upload.bin"
+
+    # Replace dangerous characters: whitespace, comma, semicolon, pipe, etc.
+    name = re.sub(r"[\s,;|&$<>()]+", "_", name)
+    name = name.strip("_.")
+
+    # Prevent hidden files
+    if name.startswith("."):
+        name = "file_" + name
+
+    return name or "upload.bin"
+
+
+def _estimate_base64_decoded_size(base64_payload: str) -> int:
+    """Estimate decoded size without actually decoding.
+
+    Args:
+        base64_payload: Base64 encoded string
+
+    Returns:
+        Estimated decoded size in bytes
+    """
+    if not base64_payload:
+        return 0
+
+    payload = base64_payload.strip()
+    if payload.startswith("data:") and "base64," in payload:
+        payload = payload.split("base64,", 1)[1]
+
+    payload = re.sub(r"\s+", "", payload)
+    padding = payload.count("=")
+
+    return max(0, (len(payload) * 3) // 4 - padding)
+
+
+def _build_results_response(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build unified results response format.
+
+    Args:
+        results: List of individual file processing results
+
+    Returns:
+        Unified response dictionary
+    """
+    if not results:
+        return {"status": "error", "error": "No files processed"}
+
+    success_count = len([r for r in results if r.get("status") == "success"])
+    error_count = len([r for r in results if r.get("status") == "error"])
+    total_count = len(results)
+
+    # Single file case: maintain backward compatibility
+    if total_count == 1:
+        result = results[0].copy()
+        return result
+
+    # Multiple files case
+    overall_status = "success"
+    if success_count == 0:
+        overall_status = "error"
+    elif error_count > 0:
+        overall_status = "partial_success"
+
+    return {
+        "status": overall_status,
+        "results": results,
+        "summary": {
+            "total_files": total_count,
+            "success_count": success_count,
+            "error_count": error_count,
+        },
+    }
+
+
+def _get_pandoc_format(format_name: str, is_input: bool = False) -> str:
+    """Get the Pandoc format name for a given format.
+
+    Args:
+        format_name: User-provided format name
+        is_input: Whether this is an input format
+
+    Returns:
+        Pandoc-compatible format name
+    """
+    format_lower = format_name.lower()
+    if is_input:
+        return INPUT_FORMAT_ALIASES.get(format_lower, format_lower)
+    return FORMAT_ALIASES.get(format_lower, format_lower)
+
+
+# === Filter and Path Resolution Functions ===
+
+
+def _resolve_filter_path(filter_path: str, defaults_file: Optional[str] = None) -> Optional[str]:
+    """Resolve a filter path by trying multiple possible locations.
+
+    Args:
+        filter_path: The original filter path (absolute or relative)
+        defaults_file: Optional path to the defaults file for context
+
+    Returns:
+        Resolved absolute path to the filter if found, or None if not found
+    """
+    # If it's already an absolute path, just use it
+    if os.path.isabs(filter_path):
+        paths = [filter_path]
+    else:
+        # Try multiple locations for relative paths
+        paths = [
+            # 1. Relative to current working directory
+            os.path.abspath(filter_path),
+            # 2. Relative to the defaults file directory (if provided)
+            os.path.join(os.path.dirname(os.path.abspath(defaults_file)), filter_path) if defaults_file else None,
+            # 3. Relative to the .pandoc/filters directory
+            os.path.join(os.path.expanduser("~"), ".pandoc", "filters", os.path.basename(filter_path))
+        ]
+        # Remove None entries
+        paths = [p for p in paths if p]
+
+    # Try each path
+    for path in paths:
+        if os.path.exists(path):
+            config.logger.debug(f"Found filter at: {path}")
+            return path
+
+    return None
+
+
+def _validate_filters(filters: list[str], defaults_file: Optional[str] = None) -> list[str]:
+    """Validate filter paths and ensure they exist and are executable.
+
+    Args:
+        filters: List of filter paths
+        defaults_file: Optional defaults file path for context
+
+    Returns:
+        List of validated, resolved filter paths
+
+    Raises:
+        ValueError: If any filter is not found or fails validation
+    """
+    validated_filters = []
+
+    for filter_path in filters:
+        resolved_path = _resolve_filter_path(filter_path, defaults_file)
+        if not resolved_path:
+            raise ValueError(f"Filter not found in any of the searched locations: {filter_path}")
+
+        # Validate the filter path using config validation
+        validation_error = config.validate_filter_path(Path(resolved_path))
+        if validation_error:
+            raise ValueError(f"Filter validation failed for {filter_path}: {validation_error}")
+
+        validated_filters.append(resolved_path)
+
+    return validated_filters
+
+
+def _format_result_info(
+    filters: Optional[list[str]] = None,
+    defaults_file: Optional[str] = None,
+    validated_filters: Optional[list[str]] = None
+) -> tuple[str, str]:
+    """Format filter and defaults file information for result messages.
+
+    Args:
+        filters: Original filter list
+        defaults_file: Defaults file path
+        validated_filters: Resolved filter paths
+
+    Returns:
+        Tuple of (filter_info, defaults_info) strings
+    """
+    filter_info = ""
+    defaults_info = ""
+
+    if filters and validated_filters:
+        filter_names = [os.path.basename(f) for f in validated_filters]
+        filter_info = f" with filters: {', '.join(filter_names)}"
+
+    if defaults_file:
+        defaults_basename = os.path.basename(defaults_file)
+        defaults_info = f" using defaults file: {defaults_basename}"
+
+    return filter_info, defaults_info
+
+
+# === Core Conversion Function ===
+
+
+async def _convert_with_pandoc(
+    contents: Optional[str] = None,
+    input_file: Optional[str] = None,
+    output_file: Optional[str] = None,
+    output_format: str = "markdown",
+    input_format: str = "markdown",
+    reference_doc: Optional[str] = None,
+    filters: Optional[list[str]] = None,
+    defaults_file: Optional[str] = None,
+    skip_path_validation: bool = False,
+) -> dict[str, Any]:
+    """Core conversion function using Pandoc.
+
+    Args:
+        contents: Content string to convert (if no input_file)
+        input_file: Path to input file
+        output_file: Path to output file (required for some formats)
+        output_format: Target format
+        input_format: Source format
+        reference_doc: Reference document for styling (docx only)
+        filters: List of Pandoc filters to apply
+        defaults_file: Pandoc defaults file path
+        skip_path_validation: Skip path validation (for internal use with temp files)
+
+    Returns:
+        Dictionary with conversion result
+    """
+    filters = filters or []
 
     # Validate input parameters
     if not contents and not input_file:
         raise ValueError("Either 'contents' or 'input_file' must be provided")
+
+    # Validate paths unless skipped (for internal temp file operations)
+    if not skip_path_validation:
+        # Validate input file path
+        if input_file:
+            validation_error = config.validate_local_path(Path(input_file))
+            if validation_error:
+                raise ValueError(f"Input file access denied: {validation_error}")
+
+        # Validate output file path
+        if output_file:
+            validation_error = config.validate_output_path(Path(output_file))
+            if validation_error:
+                raise ValueError(f"Output file access denied: {validation_error}")
+
+        # Validate reference document path
+        if reference_doc:
+            validation_error = config.validate_local_path(Path(reference_doc))
+            if validation_error:
+                raise ValueError(f"Reference document access denied: {validation_error}")
+
+        # Validate defaults file path
+        if defaults_file:
+            validation_error = config.validate_local_path(Path(defaults_file))
+            if validation_error:
+                raise ValueError(f"Defaults file access denied: {validation_error}")
 
     # Validate reference_doc if provided
     if reference_doc:
@@ -199,19 +397,16 @@ async def handle_call_tool(
         if not os.path.exists(defaults_file):
             raise ValueError(f"Defaults file not found: {defaults_file}")
 
-        # Check if it's a valid YAML file and readable
         try:
-            with open(defaults_file) as f:
+            with open(defaults_file, encoding="utf-8") as f:
                 yaml_content = yaml.safe_load(f)
 
-            # Validate the YAML structure
             if not isinstance(yaml_content, dict):
                 raise ValueError(f"Invalid defaults file format: {defaults_file} - must be a YAML dictionary")
 
-            # Check if the defaults file specifies an output format that conflicts with the requested format
             if 'to' in yaml_content and yaml_content['to'] != output_format:
-                print(
-                    f"Warning: Defaults file specifies output format '{yaml_content['to']}' "
+                config.logger.warning(
+                    f"Defaults file specifies output format '{yaml_content['to']}' "
                     f"but requested format is '{output_format}'. Using requested format."
                 )
 
@@ -219,15 +414,17 @@ async def handle_call_tool(
             raise ValueError(f"Error parsing defaults file {defaults_file}: {str(e)}") from e
         except PermissionError as e:
             raise ValueError(f"Permission denied when reading defaults file: {defaults_file}") from e
-        except Exception as e:
-            raise ValueError(f"Error reading defaults file {defaults_file}: {str(e)}") from e
 
     # Define supported formats
-    supported_formats = {'html', 'markdown', 'pdf', 'docx', 'rst', 'latex', 'epub', 'txt', 'ipynb', 'odt'}
+    supported_formats = {'html', 'markdown', 'pdf', 'docx', 'rst', 'latex', 'epub', 'txt', 'ipynb', 'odt', 'plain'}
     if output_format not in supported_formats:
         raise ValueError(
             f"Unsupported output format: '{output_format}'. Supported formats are: {', '.join(supported_formats)}"
         )
+
+    # Get Pandoc-compatible format names
+    pandoc_output_format = _get_pandoc_format(output_format, is_input=False)
+    pandoc_input_format = _get_pandoc_format(input_format, is_input=True)
 
     # Validate output_file requirement for advanced formats
     advanced_formats = {'pdf', 'docx', 'rst', 'latex', 'epub'}
@@ -238,108 +435,21 @@ async def handle_call_tool(
     if filters:
         if not isinstance(filters, list):
             raise ValueError("filters parameter must be an array of strings")
-
         for filter_path in filters:
             if not isinstance(filter_path, str):
                 raise ValueError("Each filter must be a string path")
-
-    def resolve_filter_path(filter_path, defaults_file=None):
-        """Resolve a filter path by trying multiple possible locations.
-
-        Args:
-        ----
-            filter_path: The original filter path (absolute or relative)
-            defaults_file: Optional path to the defaults file for context
-
-        Returns:
-        -------
-            Resolved absolute path to the filter if found, or None if not found
-
-        """
-        # If it's already an absolute path, just use it
-        if os.path.isabs(filter_path):
-            paths = [filter_path]
-        else:
-            # Try multiple locations for relative paths
-            paths = [
-                # 1. Relative to current working directory
-                os.path.abspath(filter_path),
-
-                # 2. Relative to the defaults file directory (if provided)
-                os.path.join(os.path.dirname(os.path.abspath(defaults_file)), filter_path) if defaults_file else None,
-
-                # 3. Relative to the .pandoc/filters directory
-                os.path.join(os.path.expanduser("~"), ".pandoc", "filters", os.path.basename(filter_path))
-            ]
-            # Remove None entries
-            paths = [p for p in paths if p]
-
-        # Try each path
-        for path in paths:
-            if os.path.exists(path):
-                # Check if executable and try to make it executable if not
-                if not os.access(path, os.X_OK):
-                    try:
-                        os.chmod(path, os.stat(path).st_mode | 0o111)
-                        print(f"Made filter executable: {path}")
-                    except Exception as e:
-                        print(f"Warning: Could not make filter executable: {path} - {str(e)}")
-                        continue
-
-                print(f"Using filter: {path}")
-                return path
-
-        return None
-
-    def validate_filters(filters, defaults_file=None):
-        """Validate filter paths and ensure they exist and are executable."""
-        validated_filters = []
-
-        for filter_path in filters:
-            resolved_path = resolve_filter_path(filter_path, defaults_file)
-            if resolved_path:
-                validated_filters.append(resolved_path)
-            else:
-                raise ValueError(f"Filter not found in any of the searched locations: {filter_path}")
-
-        return validated_filters
-
-    def format_result_info(filters=None, defaults_file=None, validated_filters=None):
-        """Format filter and defaults file information for result messages."""
-        filter_info = ""
-        defaults_info = ""
-
-        if filters and validated_filters:
-            filter_names = [os.path.basename(f) for f in validated_filters]
-            filter_info = f" with filters: {', '.join(filter_names)}"
-
-        if defaults_file:
-            defaults_basename = os.path.basename(defaults_file)
-            defaults_info = f" using defaults file: {defaults_basename}"
-
-        return filter_info, defaults_info
 
     try:
         # Prepare conversion arguments
         extra_args = []
 
-        # Add defaults file if provided - ensure it's properly formatted for Pandoc
+        # Add defaults file if provided
         if defaults_file:
-            # Make sure the path is absolute
             defaults_file_abs = os.path.abspath(defaults_file)
             extra_args.extend(["--defaults", defaults_file_abs])
 
-        # Set environment variables for filters
-        env = os.environ.copy()
-        if output_file:
-            # Set PANDOC_OUTPUT_DIR to the directory of the output file
-            output_dir = os.path.dirname(os.path.abspath(output_file))
-            env["PANDOC_OUTPUT_DIR"] = output_dir
-        else:
-            output_dir = None
-
         # Validate filters once and reuse the result
-        validated_filters = validate_filters(filters, defaults_file) if filters else []
+        validated_filters = _validate_filters(filters, defaults_file) if filters else []
 
         # Handle filter arguments
         for filter_path in validated_filters:
@@ -358,76 +468,285 @@ async def handle_call_tool(
                 "--reference-doc", reference_doc
             ])
 
-        # No special processing needed for content
-
         # Convert content using pypandoc
         if input_file:
             if not os.path.exists(input_file):
                 raise ValueError(f"Input file not found: {input_file}")
 
-
             if output_file:
                 # Convert file to file
-                converted_output = pypandoc.convert_file(
+                pypandoc.convert_file(
                     input_file,
-                    output_format,
+                    pandoc_output_format,
                     outputfile=output_file,
                     extra_args=extra_args
                 )
 
-                # Create result message with filter and defaults information
-                filter_info, defaults_info = format_result_info(filters, defaults_file, validated_filters)
-                result_message = f"File successfully converted{filter_info}{defaults_info} and saved to: {output_file}"
+                filter_info, defaults_info = _format_result_info(filters, defaults_file, validated_filters)
+                return {
+                    "status": "success",
+                    "message": f"File successfully converted{filter_info}{defaults_info} and saved to: {output_file}",
+                    "output_file": output_file,
+                }
             else:
                 # Convert file to string
                 converted_output = pypandoc.convert_file(
                     input_file,
-                    output_format,
+                    pandoc_output_format,
                     extra_args=extra_args
                 )
+                filter_info, defaults_info = _format_result_info(filters, defaults_file, validated_filters)
+                return {
+                    "status": "success",
+                    "content": converted_output,
+                    "message": f"Content converted to {output_format}{filter_info}{defaults_info}",
+                }
         else:
-            # No special processing needed for content
-
             if output_file:
                 # Convert content to file
                 pypandoc.convert_text(
                     contents,
-                    output_format,
-                    format=input_format,
+                    pandoc_output_format,
+                    format=pandoc_input_format,
                     outputfile=output_file,
                     extra_args=extra_args
                 )
 
-                # Create result message with filter and defaults information
-                filter_info, defaults_info = format_result_info(filters, defaults_file, validated_filters)
-                result_message = (
-                    f"Content successfully converted{filter_info}{defaults_info} and saved to: {output_file}"
-                )
+                filter_info, defaults_info = _format_result_info(filters, defaults_file, validated_filters)
+                return {
+                    "status": "success",
+                    "message": f"Content successfully converted{filter_info}{defaults_info} and saved to: {output_file}",
+                    "output_file": output_file,
+                }
             else:
                 # Convert content to string
                 converted_output = pypandoc.convert_text(
                     contents,
-                    output_format,
-                    format=input_format,
+                    pandoc_output_format,
+                    format=pandoc_input_format,
                     extra_args=extra_args
                 )
 
-        if output_file:
-            notify_with_result = result_message
+                if not converted_output:
+                    raise ValueError("Conversion resulted in empty output")
+
+                filter_info, defaults_info = _format_result_info(filters, defaults_file, validated_filters)
+                return {
+                    "status": "success",
+                    "content": converted_output,
+                    "message": f"Content converted to {output_format}{filter_info}{defaults_info}",
+                }
+
+    except Exception as e:
+        error_prefix = "Error converting"
+        error_details = str(e)
+
+        if "Filter not found" in error_details or "Filter is not executable" in error_details:
+            error_prefix = "Filter error during conversion"
+        elif "defaults" in error_details and defaults_file:
+            error_prefix = "Defaults file error during conversion"
+            error_details += f" (defaults file: {defaults_file})"
+        elif "pandoc" in error_details.lower() and "not found" in error_details.lower():
+            error_prefix = "Pandoc executable not found"
+            error_details = "Please ensure Pandoc is installed and available in your PATH"
+
+        raise ValueError(
+            f"{error_prefix} {'file' if input_file else 'contents'} from {input_format} to "
+            f"{output_format}: {error_details}"
+        ) from e
+
+
+# === MCP Tool Handlers ===
+
+
+@server.list_tools()
+async def handle_list_tools() -> list[types.Tool]:
+    """List available tools.
+
+    Each tool specifies its arguments using JSON Schema validation.
+    """
+    tools = [
+        types.Tool(
+            name="convert-contents",
+            description=(
+                "Converts content between different formats. Transforms input content from any supported format "
+                "into the specified output format.\n\n"
+                "Supported formats: markdown, html, pdf, docx, rst, latex, epub, txt, ipynb, odt\n\n"
+                "Features:\n"
+                "- Custom DOCX styling with reference documents\n"
+                "- Pandoc filter support for custom transformations\n"
+                "- Defaults file support for batch configuration\n\n"
+                "Requirements:\n"
+                "- PDF conversion requires TeX Live (xelatex)\n"
+                "- Advanced formats (pdf, docx, rst, latex, epub) require output_file path"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "contents": {
+                        "type": "string",
+                        "description": "The content to be converted (required if input_file not provided)"
+                    },
+                    "input_file": {
+                        "type": "string",
+                        "description": "Complete path to input file (e.g., '/path/to/input.md')"
+                    },
+                    "input_format": {
+                        "type": "string",
+                        "description": "Source format of the content (defaults to markdown)",
+                        "default": "markdown",
+                        "enum": ["markdown", "html", "pdf", "docx", "rst", "latex", "epub", "txt", "ipynb", "odt"]
+                    },
+                    "output_format": {
+                        "type": "string",
+                        "description": "Desired output format (defaults to markdown)",
+                        "default": "markdown",
+                        "enum": ["markdown", "html", "pdf", "docx", "rst", "latex", "epub", "txt", "ipynb", "odt"]
+                    },
+                    "output_file": {
+                        "type": "string",
+                        "description": "Complete path where to save the output (required for pdf, docx, rst, latex, epub)"
+                    },
+                    "reference_doc": {
+                        "type": "string",
+                        "description": "Path to a reference document for styling (docx output only)"
+                    },
+                    "filters": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of Pandoc filter paths to apply during conversion"
+                    },
+                    "defaults_file": {
+                        "type": "string",
+                        "description": "Path to a Pandoc defaults file (YAML) containing conversion options"
+                    }
+                },
+                "additionalProperties": False
+            },
+        ),
+        types.Tool(
+            name="convert-contents-base64",
+            description=(
+                "Converts file content uploaded via base64 encoding. Designed for remote HTTP scenarios "
+                "where direct file path access is not available.\n\n"
+                "Usage:\n"
+                "- Upload files as base64 encoded strings\n"
+                "- Supports data URL prefix (data:...;base64,...)\n"
+                "- Multiple files can be converted in one request\n"
+                "- Binary outputs (docx, pdf, epub, odt) are returned as base64\n\n"
+                "Supported formats: markdown, html, pdf, docx, rst, latex, epub, txt, ipynb, odt\n\n"
+                "Example files format:\n"
+                '[{"filename": "doc.md", "content_base64": "IyBIZWxsbyBXb3JsZA=="}]'
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "files": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "filename": {
+                                    "type": "string",
+                                    "description": "Original filename with extension"
+                                },
+                                "content_base64": {
+                                    "type": "string",
+                                    "description": "Base64 encoded file content"
+                                }
+                            },
+                            "required": ["filename", "content_base64"]
+                        },
+                        "description": "Array of files to convert"
+                    },
+                    "output_format": {
+                        "type": "string",
+                        "description": "Desired output format",
+                        "default": "markdown",
+                        "enum": ["markdown", "html", "pdf", "docx", "rst", "latex", "epub", "txt", "ipynb", "odt"]
+                    },
+                    "input_format": {
+                        "type": "string",
+                        "description": "Source format (optional, auto-detected from filename)",
+                        "enum": ["markdown", "html", "pdf", "docx", "rst", "latex", "epub", "txt", "ipynb", "odt"]
+                    },
+                    "keep_uploaded_files": {
+                        "type": "boolean",
+                        "description": "Keep uploaded files on server after conversion (default: false)",
+                        "default": False
+                    }
+                },
+                "required": ["files", "output_format"],
+                "additionalProperties": False
+            },
+        ),
+    ]
+
+    return tools
+
+
+@server.call_tool()
+async def handle_call_tool(
+    name: str, arguments: dict | None
+) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
+    """Handle tool execution requests.
+
+    Tools can modify server state and notify clients of changes.
+    """
+    if name not in ["convert-contents", "convert-contents-base64"]:
+        raise ValueError(f"Unknown tool: {name}")
+
+    config.logger.debug(f"Tool call: {name}, arguments: {arguments}")
+
+    if not arguments:
+        raise ValueError("Missing arguments")
+
+    if name == "convert-contents":
+        return await _handle_convert_contents(arguments)
+    elif name == "convert-contents-base64":
+        return await _handle_convert_contents_base64(arguments)
+    else:
+        raise ValueError(f"Unknown tool: {name}")
+
+
+async def _handle_convert_contents(
+    arguments: dict
+) -> list[types.TextContent]:
+    """Handle convert-contents tool execution.
+
+    Args:
+        arguments: Tool arguments
+
+    Returns:
+        List of text content responses
+    """
+    contents = arguments.get("contents")
+    input_file = arguments.get("input_file")
+    output_file = arguments.get("output_file")
+    output_format = (arguments.get("output_format") or "markdown").lower()
+    input_format = (arguments.get("input_format") or "markdown").lower()
+    reference_doc = arguments.get("reference_doc")
+    filters = arguments.get("filters", [])
+    defaults_file = arguments.get("defaults_file")
+
+    try:
+        result = await _convert_with_pandoc(
+            contents=contents,
+            input_file=input_file,
+            output_file=output_file,
+            output_format=output_format,
+            input_format=input_format,
+            reference_doc=reference_doc,
+            filters=filters,
+            defaults_file=defaults_file,
+        )
+
+        if result.get("output_file"):
+            notify_with_result = result["message"]
         else:
-            if not converted_output:
-                raise ValueError("Conversion resulted in empty output")
-
-            # Add filter and defaults information to the notification
-            filter_info, defaults_info = format_result_info(filters, defaults_file, validated_filters)
-            # Adjust format for inline display
-            if filter_info:
-                filter_info = f" (with filters: {', '.join([os.path.basename(f) for f in validated_filters])})"
-            if defaults_info:
-                defaults_info = f" (using defaults file: {os.path.basename(defaults_file)})"
-
+            converted_output = result.get("content", "")
             notify_with_result = (
-                f'Following are the converted contents in {output_format} format{filter_info}{defaults_info}.\n'
+                f'Following are the converted contents in {output_format} format.\n'
                 f'Ask user if they expect to save this file. If so, provide the output_file parameter with '
                 f'complete path.\n'
                 f'Converted Contents:\n\n{converted_output}'
@@ -441,25 +760,364 @@ async def handle_call_tool(
         ]
 
     except Exception as e:
-        # Handle Pandoc conversion errors
-        error_prefix = "Error converting"
-        error_details = str(e)
+        raise ValueError(str(e)) from e
 
-        if "Filter not found" in error_details or "Filter is not executable" in error_details:
-            error_prefix = "Filter error during conversion"
-        elif "defaults" in error_details and defaults_file:
-            error_prefix = "Defaults file error during conversion"
-            # Add more context about the defaults file
-            error_details += f" (defaults file: {defaults_file})"
-        elif "pandoc" in error_details.lower() and "not found" in error_details.lower():
-            error_prefix = "Pandoc executable not found"
-            error_details = "Please ensure Pandoc is installed and available in your PATH"
 
-        error_msg = (
-            f"{error_prefix} {'file' if input_file else 'contents'} from {input_format} to "
-            f"{output_format}: {error_details}"
+async def _handle_convert_contents_base64(
+    arguments: dict
+) -> list[types.TextContent]:
+    """Handle convert-contents-base64 tool execution.
+
+    Args:
+        arguments: Tool arguments
+
+    Returns:
+        List of text content responses
+    """
+    files = arguments.get("files", [])
+    output_format = arguments.get("output_format", "markdown").lower()
+    input_format = arguments.get("input_format")
+    keep_uploaded_files = arguments.get("keep_uploaded_files", False)
+
+    if not files:
+        raise ValueError("files parameter is required and cannot be empty")
+
+    # Check batch limits
+    if len(files) > config.MAX_UPLOAD_FILES:
+        raise ValueError(
+            f"Too many files: {len(files)}, maximum is {config.MAX_UPLOAD_FILES}"
         )
-        raise ValueError(error_msg) from e
+
+    # Estimate total size
+    total_estimated_size = 0
+    for item in files:
+        if isinstance(item, dict) and isinstance(item.get("content_base64"), str):
+            total_estimated_size += _estimate_base64_decoded_size(item["content_base64"])
+
+    if total_estimated_size > config.MAX_TOTAL_UPLOAD_BYTES:
+        raise ValueError(
+            f"Total upload size too large: estimated {total_estimated_size} bytes, "
+            f"limit is {config.MAX_TOTAL_UPLOAD_BYTES} bytes"
+        )
+
+    # Create temporary upload directory
+    temp_dir = config.ensure_temp_dir()
+    upload_dir = temp_dir / "_uploads" / secrets.token_hex(12)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    results = []
+
+    try:
+        for item in files:
+            if not isinstance(item, dict):
+                results.append({
+                    "status": "error",
+                    "error_message": "Each file must be an object with filename and content_base64"
+                })
+                continue
+
+            # Sanitize filename
+            filename = _sanitize_filename(item.get("filename", ""))
+            content_b64 = item.get("content_base64")
+
+            if not isinstance(content_b64, str):
+                results.append({
+                    "filename": filename,
+                    "status": "error",
+                    "error_message": "Missing or invalid content_base64"
+                })
+                continue
+
+            try:
+                # Estimate file size before decoding
+                estimated_size = _estimate_base64_decoded_size(content_b64)
+                if estimated_size > config.MAX_UPLOAD_BYTES:
+                    raise ValueError(
+                        f"File too large: estimated {estimated_size} bytes, "
+                        f"limit is {config.MAX_UPLOAD_BYTES} bytes"
+                    )
+
+                # Decode base64
+                file_bytes = _decode_base64_payload(content_b64)
+
+                # Verify actual size
+                if len(file_bytes) > config.MAX_UPLOAD_BYTES:
+                    raise ValueError(
+                        f"File too large: {len(file_bytes)} bytes, "
+                        f"limit is {config.MAX_UPLOAD_BYTES} bytes"
+                    )
+
+                # Save to temporary file
+                temp_path = upload_dir / filename
+                temp_path.write_bytes(file_bytes)
+
+                # Determine input format from filename if not specified
+                file_input_format = input_format
+                if not file_input_format:
+                    ext = Path(filename).suffix.lower().lstrip(".")
+                    format_map = {
+                        "md": "markdown",
+                        "html": "html",
+                        "htm": "html",
+                        "txt": "txt",
+                        "rst": "rst",
+                        "tex": "latex",
+                        "docx": "docx",
+                        "odt": "odt",
+                        "epub": "epub",
+                        "ipynb": "ipynb",
+                    }
+                    file_input_format = format_map.get(ext, "markdown")
+
+                # Determine output file path
+                output_ext = output_format
+                if output_format == "latex":
+                    output_ext = "tex"
+                elif output_format == "markdown":
+                    output_ext = "md"
+                elif output_format == "plain" or output_format == "txt":
+                    output_ext = "txt"
+
+                output_filename = f"{Path(filename).stem}.{output_ext}"
+                output_path = upload_dir / output_filename
+
+                # Convert file (skip path validation for internal temp files)
+                result = await _convert_with_pandoc(
+                    input_file=str(temp_path),
+                    output_file=str(output_path),
+                    output_format=output_format,
+                    input_format=file_input_format,
+                    skip_path_validation=True,
+                )
+
+                # Read converted content based on format type
+                if output_format in BINARY_FORMATS:
+                    # Return binary content as base64
+                    try:
+                        output_bytes = output_path.read_bytes()
+                        result["content_base64"] = _encode_base64(output_bytes)
+                        result["content_type"] = MIME_TYPES.get(output_format, f"application/{output_format}")
+                    except (OSError, IOError) as e:
+                        config.logger.error(f"Failed to read output file: {e}")
+                else:
+                    # Return text content directly (including ipynb which is JSON)
+                    try:
+                        converted_content = output_path.read_text(encoding="utf-8")
+                        result["content"] = converted_content
+                        if output_format == "ipynb":
+                            result["content_type"] = MIME_TYPES.get("ipynb", "application/json")
+                    except (OSError, UnicodeDecodeError) as e:
+                        config.logger.error(f"Failed to read output file: {e}")
+
+                result["filename"] = filename
+                results.append(result)
+
+            except Exception as e:
+                results.append({
+                    "filename": filename,
+                    "status": "error",
+                    "error_message": str(e)
+                })
+
+    finally:
+        # Clean up temporary files if not keeping
+        if not keep_uploaded_files and upload_dir.exists():
+            try:
+                shutil.rmtree(upload_dir)
+            except (OSError, PermissionError) as e:
+                config.logger.error(f"Failed to clean up temporary files: {str(e)}")
+
+    # Build response
+    response = _build_results_response(results)
+
+    # Format output for text response
+    if response.get("status") == "success" and len(results) == 1:
+        result = results[0]
+        if result.get("content"):
+            text_output = (
+                f"File '{result.get('filename')}' successfully converted to {output_format}.\n\n"
+                f"Converted Content:\n\n{result['content']}"
+            )
+        elif result.get("content_base64"):
+            text_output = (
+                f"File '{result.get('filename')}' successfully converted to {output_format}.\n\n"
+                f"Binary output (base64):\n{result['content_base64'][:100]}...\n"
+                f"(Total {len(result['content_base64'])} characters)"
+            )
+        else:
+            text_output = f"File '{result.get('filename')}' successfully converted to {output_format}."
+    else:
+        # Multiple files or error case
+        text_output = f"Conversion results: {response['status']}\n"
+        if response.get("summary"):
+            summary = response["summary"]
+            text_output += (
+                f"Total: {summary['total_files']}, "
+                f"Success: {summary['success_count']}, "
+                f"Errors: {summary['error_count']}\n\n"
+            )
+
+        for result in results:
+            status = result.get("status", "unknown")
+            fname = result.get("filename", "unknown")
+            if status == "success":
+                text_output += f"  [OK] {fname}\n"
+                if result.get("content"):
+                    # Truncate long content
+                    content_preview = result["content"][:500]
+                    if len(result["content"]) > 500:
+                        content_preview += "...[truncated]"
+                    text_output += f"    Preview: {content_preview}\n"
+                elif result.get("content_base64"):
+                    text_output += f"    Binary output: {len(result['content_base64'])} chars (base64)\n"
+            else:
+                error_msg = result.get("error_message", "Unknown error")
+                text_output += f"  [ERROR] {fname}: {error_msg}\n"
+
+    return [
+        types.TextContent(
+            type="text",
+            text=text_output
+        )
+    ]
+
+
+# === Server Startup Functions ===
+
+
+def create_sse_app():
+    """Create Starlette app for SSE transport.
+
+    Returns:
+        Starlette application configured for SSE
+    """
+    try:
+        from mcp.server.sse import SseServerTransport
+        from starlette.applications import Starlette
+        from starlette.requests import Request
+        from starlette.routing import Mount, Route
+    except ImportError as e:
+        raise ImportError(
+            "SSE mode requires additional dependencies. "
+            "Install with: pip install starlette uvicorn"
+        ) from e
+
+    sse = SseServerTransport("/messages/")
+
+    async def handle_sse(request: Request):
+        """Handle SSE connection requests."""
+        async with sse.connect_sse(
+            request.scope,
+            request.receive,
+            request._send,
+        ) as (read_stream, write_stream):
+            await server.run(
+                read_stream,
+                write_stream,
+                InitializationOptions(
+                    server_name="mcp-pandoc",
+                    server_version="0.9.0",
+                    capabilities=server.get_capabilities(
+                        notification_options=NotificationOptions(),
+                        experimental_capabilities={},
+                    ),
+                ),
+            )
+
+    return Starlette(
+        debug=config.DEBUG_MODE,
+        routes=[
+            Route("/sse", endpoint=handle_sse),
+            Mount("/messages/", app=sse.handle_post_message),
+        ],
+    )
+
+
+def create_streamable_http_app():
+    """Create Starlette app for Streamable HTTP transport.
+
+    Returns:
+        Starlette application configured for Streamable HTTP
+    """
+    from contextlib import asynccontextmanager
+    from collections.abc import AsyncIterator
+
+    try:
+        from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+        from starlette.applications import Starlette
+        from starlette.routing import Mount
+    except ImportError as e:
+        raise ImportError(
+            "Streamable HTTP mode requires additional dependencies. "
+            "Install with: pip install starlette uvicorn"
+        ) from e
+
+    session_manager = StreamableHTTPSessionManager(
+        app=server,
+        json_response=True,  # Use JSON responses for better compatibility
+    )
+
+    @asynccontextmanager
+    async def lifespan(app: Starlette) -> AsyncIterator[None]:
+        """Manage session manager lifecycle."""
+        async with session_manager.run():
+            yield
+
+    return Starlette(
+        debug=config.DEBUG_MODE,
+        routes=[
+            Mount("/mcp", app=session_manager.handle_request),
+        ],
+        lifespan=lifespan,
+    )
+
+
+def run_server(mode: str = "stdio", port: int = 8001, host: str = "127.0.0.1"):
+    """Run the MCP server with specified transport mode.
+
+    Args:
+        mode: Transport mode - "stdio", "sse", or "streamable-http"
+        port: Port number for HTTP modes
+        host: Host address for HTTP modes
+    """
+    import asyncio
+
+    # Ensure output directory exists
+    config.ensure_output_dir(get_output_dir())
+
+    config.logger.info(f"Starting Pandoc MCP server in {mode} mode")
+    config.logger.info(f"Output directory: {get_output_dir()}")
+    config.logger.info(f"Configuration: {config.get_config_summary()}")
+
+    if mode == "sse":
+        try:
+            import uvicorn
+        except ImportError as e:
+            raise ImportError(
+                "SSE mode requires uvicorn. Install with: pip install uvicorn"
+            ) from e
+
+        config.logger.info(f"Starting SSE server on {host}:{port}")
+        app = create_sse_app()
+        uvicorn.run(app, host=host, port=port)
+
+    elif mode == "streamable-http":
+        try:
+            import uvicorn
+        except ImportError as e:
+            raise ImportError(
+                "Streamable HTTP mode requires uvicorn. Install with: pip install uvicorn"
+            ) from e
+
+        config.logger.info(f"Starting Streamable HTTP server on {host}:{port}")
+        config.logger.info(f"MCP endpoint: http://{host}:{port}/mcp")
+        app = create_streamable_http_app()
+        uvicorn.run(app, host=host, port=port)
+
+    else:
+        # Default: stdio mode
+        asyncio.run(main())
+
 
 async def main():
     """Run the mcp-pandoc server using stdin/stdout streams."""
@@ -469,7 +1127,7 @@ async def main():
             write_stream,
             InitializationOptions(
                 server_name="mcp-pandoc",
-                server_version="0.8.1",  # Universal MCP compatibility & SDK upgrade
+                server_version="0.9.0",
                 capabilities=server.get_capabilities(
                     notification_options=NotificationOptions(),
                     experimental_capabilities={},
