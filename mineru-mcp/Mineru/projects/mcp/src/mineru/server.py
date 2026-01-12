@@ -106,8 +106,18 @@ def run_server(mode=None, port=8001, host="127.0.0.1"):
             config.logger.info(f"启动Streamable HTTP服务器: {host}:{port}")
             # 在HTTP模式下传递主机与端口（兼容旧版 fastmcp.run 签名）
             run_params = {"port": port}
-            if "host" in inspect.signature(mcp.run).parameters:
+            run_signature = inspect.signature(mcp.run)
+            run_params_meta = run_signature.parameters
+            accepts_kwargs = any(
+                param.kind == inspect.Parameter.VAR_KEYWORD
+                for param in run_params_meta.values()
+            )
+            if "host" in run_params_meta or accepts_kwargs:
                 run_params["host"] = host
+            else:
+                config.logger.warning(
+                    "fastmcp.run 未暴露 host 参数，可能仍绑定到 127.0.0.1"
+                )
             mcp.run(mode, **run_params)
         else:
             # 默认stdio模式
