@@ -8,6 +8,7 @@ import shutil
 import re
 import traceback
 import mimetypes
+import inspect
 from pathlib import Path
 from typing import Annotated, Any, Dict, List, Optional
 
@@ -103,8 +104,11 @@ def run_server(mode=None, port=8001, host="127.0.0.1"):
             uvicorn.run(starlette_app, host=host, port=port)
         elif mode == "streamable-http":
             config.logger.info(f"启动Streamable HTTP服务器: {host}:{port}")
-            # 在HTTP模式下传递端口参数
-            mcp.run(mode, port=port)
+            # 在HTTP模式下传递主机与端口（兼容旧版 fastmcp.run 签名）
+            run_params = {"port": port}
+            if "host" in inspect.signature(mcp.run).parameters:
+                run_params["host"] = host
+            mcp.run(mode, **run_params)
         else:
             # 默认stdio模式
             config.logger.info("启动STDIO服务器")
