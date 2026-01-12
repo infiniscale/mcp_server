@@ -88,6 +88,30 @@ def run_server(mode=None, port=8001, host="127.0.0.1"):
     # 确保输出目录存在
     config.ensure_output_dir(output_dir)
 
+    effective_mode = mode or "stdio"
+    config.logger.info(
+        f"服务启动配置: mode={effective_mode}, host={host}, port={port}, "
+        f"output_dir={output_dir}"
+    )
+    config.logger.debug(
+        "环境配置: USE_LOCAL_API=%s, LOCAL_MINERU_API_BASE=%s, MINERU_API_BASE=%s, "
+        "MCP_DISABLE_PATH_INPUT=%s, MCP_REQUIRE_PATH_ALLOWLIST=%s, "
+        "MCP_ALLOWED_INPUT_ROOTS=%s, MAX_FILE_BYTES=%s, MAX_UPLOAD_BYTES=%s",
+        config.USE_LOCAL_API,
+        config.LOCAL_MINERU_API_BASE,
+        config.MINERU_API_BASE,
+        config.MCP_DISABLE_PATH_INPUT,
+        config.MCP_REQUIRE_PATH_ALLOWLIST,
+        [str(p) for p in config.MCP_ALLOWED_INPUT_ROOTS],
+        config.MAX_FILE_BYTES,
+        config.MAX_UPLOAD_BYTES,
+    )
+    if config.USE_LOCAL_API and not config.LOCAL_MINERU_API_BASE:
+        config.logger.warning(
+            "USE_LOCAL_API=true 但 LOCAL_MINERU_API_BASE 为空，"
+            "请检查环境变量覆盖。"
+        )
+
     # 检查是否设置了 API 密钥
     if not config.MINERU_API_KEY:
         config.logger.warning("警告: MINERU_API_KEY 环境变量未设置。")
@@ -396,6 +420,12 @@ async def convert_file_url(
 
     # 使用submit_file_url_task处理URLs
     try:
+        config.logger.info(
+            "远程URL解析请求: enable_ocr=%s, language=%s, page_ranges=%s",
+            enable_ocr,
+            language,
+            page_ranges,
+        )
         result_path = await get_client().process_file_to_markdown(
             lambda urls, o: get_client().submit_file_url_task(
                 urls,
@@ -479,6 +509,12 @@ async def convert_file_path(
 
     # 使用submit_file_task处理文件
     try:
+        config.logger.info(
+            "远程本地文件解析请求: enable_ocr=%s, language=%s, page_ranges=%s",
+            enable_ocr,
+            language,
+            page_ranges,
+        )
         result_path = await get_client().process_file_to_markdown(
             lambda files, o: get_client().submit_file_task(
                 files,
@@ -518,17 +554,25 @@ async def local_parse_file(
 
     # 检查文件是否存在
     if not file_path.exists():
+        config.logger.warning(f"本地文件不存在: {file_path}")
         return {"status": "error", "error": f"文件不存在: {file_path}"}
 
     try:
         # 根据环境变量决定使用本地API还是远程API
         if config.USE_LOCAL_API:
-            config.logger.debug(f"使用本地API: {config.LOCAL_MINERU_API_BASE}")
+            config.logger.info(
+                "使用本地API解析: file=%s, parse_method=%s, base=%s",
+                file_path.name,
+                parse_method,
+                config.LOCAL_MINERU_API_BASE,
+            )
+            config.logger.debug(f"本地API完整路径: {file_path}")
             return await _parse_file_local(
                 file_path=str(file_path),
                 parse_method=parse_method,
             )
         else:
+            config.logger.warning("USE_LOCAL_API=false，跳过本地API解析")
             return {"status": "error", "error": "远程API未配置"}
     except Exception as e:
         config.logger.error(f"解析文件时出错: {str(e)}")
@@ -962,6 +1006,10 @@ async def _parse_documents_from_sources_list(
     results: List[Dict[str, Any]] = []
 
     if config.MCP_DISABLE_PATH_INPUT and file_paths and not allow_paths_when_disabled:
+        config.logger.warning(
+            "拒绝本地路径输入: MCP_DISABLE_PATH_INPUT=true, files=%s",
+            len(file_paths),
+        )
         return [
             {
                 "status": "error",
@@ -969,8 +1017,23 @@ async def _parse_documents_from_sources_list(
             }
         ]
 
+    config.logger.info(
+        "解析请求分类: urls=%s, files=%s, use_local_api=%s",
+        len(url_paths),
+        len(file_paths),
+        config.USE_LOCAL_API,
+    )
+    if url_paths:
+        config.logger.debug(f"URL列表: {url_paths}")
+    if file_paths:
+        config.logger.debug(f"文件列表: {file_paths}")
+
     if config.USE_LOCAL_API:
         if not file_paths:
+            if url_paths:
+                config.logger.warning(
+                    "本地API模式下收到URL，将被忽略: urls=%s", len(url_paths)
+                )
             return [
                 {
                     "status": "warning",
@@ -984,6 +1047,7 @@ async def _parse_documents_from_sources_list(
             try:
                 path_obj = Path(path)
                 if not path_obj.exists():
+                    config.logger.warning(f"本地文件不存在: {path}")
                     results.append(
                         {
                             "filename": path_obj.name,
@@ -1000,6 +1064,11 @@ async def _parse_documents_from_sources_list(
                     allow_when_disabled=allow_paths_when_disabled,
                 )
                 if validation_error:
+                    config.logger.warning(
+                        "本地文件路径校验失败: %s, reason=%s",
+                        path_obj,
+                        validation_error,
+                    )
                     results.append(
                         {
                             "filename": path_obj.name,
@@ -1082,6 +1151,7 @@ async def _parse_documents_from_sources_list(
         for file_path in file_paths:
             path_obj = Path(file_path)
             if not path_obj.exists():
+                config.logger.warning(f"本地文件不存在: {file_path}")
                 results.append(
                     {
                         "filename": path_obj.name,
@@ -1097,6 +1167,11 @@ async def _parse_documents_from_sources_list(
                     allow_when_disabled=allow_paths_when_disabled,
                 )
                 if validation_error:
+                    config.logger.warning(
+                        "本地文件路径校验失败: %s, reason=%s",
+                        path_obj,
+                        validation_error,
+                    )
                     results.append(
                         {
                             "filename": path_obj.name,
@@ -1303,6 +1378,8 @@ async def _parse_file_local(
     """
     # API URL路径
     api_url = f"{config.LOCAL_MINERU_API_BASE}/file_parse"
+    if not config.LOCAL_MINERU_API_BASE:
+        config.logger.warning("LOCAL_MINERU_API_BASE 为空，可能无法构建有效URL")
 
     # 使用Path对象确保文件路径正确
     file_path_obj = Path(file_path)
