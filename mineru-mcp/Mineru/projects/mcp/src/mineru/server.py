@@ -1,7 +1,6 @@
 """MinerU File转Markdown转换的FastMCP服务器实现。"""
 
-import base64
-import binascii
+import asyncio
 import json
 import secrets
 import shutil
@@ -9,6 +8,7 @@ import re
 import traceback
 import mimetypes
 import inspect
+from urllib.parse import urlparse, unquote
 from pathlib import Path
 from typing import Annotated, Any, Dict, List, Optional
 
@@ -22,6 +22,11 @@ from starlette.requests import Request
 from starlette.routing import Mount, Route
 
 from . import config
+
+try:
+    from fastmcp import Context
+except Exception:
+    Context = Any
 from .api import MinerUClient
 from .language import get_language_list
 
@@ -33,8 +38,7 @@ mcp = FastMCP(
     PDF、Word、PPT以及图片格式（JPG、PNG、JPEG）。
 
     系统工具:
-    parse_documents: 解析文档（支持本地文件和URL，自动读取内容）
-    parse_documents_base64: 解析通过base64上传的文件内容（远端场景适用）
+    parse_documet: 解析文档（从对象存储或MCP运行时获取文件并解析）
     get_ocr_languages: 获取OCR支持的语言列表
     """,
 )
@@ -96,7 +100,8 @@ def run_server(mode=None, port=8001, host="127.0.0.1"):
     config.logger.debug(
         "环境配置: USE_LOCAL_API=%s, LOCAL_MINERU_API_BASE=%s, MINERU_API_BASE=%s, "
         "MCP_DISABLE_PATH_INPUT=%s, MCP_REQUIRE_PATH_ALLOWLIST=%s, "
-        "MCP_ALLOWED_INPUT_ROOTS=%s, MAX_FILE_BYTES=%s, MAX_UPLOAD_BYTES=%s",
+        "MCP_ALLOWED_INPUT_ROOTS=%s, MAX_FILE_BYTES=%s, MAX_UPLOAD_BYTES=%s, "
+        "OBJECT_STORAGE_ENDPOINT=%s, OBJECT_STORAGE_ACCESS_KEY_SET=%s",
         config.USE_LOCAL_API,
         config.LOCAL_MINERU_API_BASE,
         config.MINERU_API_BASE,
@@ -105,6 +110,8 @@ def run_server(mode=None, port=8001, host="127.0.0.1"):
         [str(p) for p in config.MCP_ALLOWED_INPUT_ROOTS],
         config.MAX_FILE_BYTES,
         config.MAX_UPLOAD_BYTES,
+        config.OBJECT_STORAGE_ENDPOINT,
+        bool(config.OBJECT_STORAGE_ACCESS_KEY),
     )
     if config.USE_LOCAL_API and not config.LOCAL_MINERU_API_BASE:
         config.logger.warning(
@@ -222,36 +229,6 @@ def parse_list_input(input_str: str) -> List[str]:
     return result
 
 
-def _estimate_base64_decoded_size(base64_payload: str) -> int:
-    """估算 base64 解码后的字节长度（不进行实际解码）。"""
-    if not base64_payload:
-        return 0
-
-    payload = base64_payload.strip()
-    if payload.startswith("data:") and "base64," in payload:
-        payload = payload.split("base64,", 1)[1]
-
-    payload = re.sub(r"\s+", "", payload)
-    padding = payload.count("=")
-    return max(0, (len(payload) * 3) // 4 - padding)
-
-
-def _decode_base64_payload(base64_payload: str) -> bytes:
-    """将 base64（可包含 data URL 前缀/空白）解码为 bytes。"""
-    if not base64_payload:
-        raise ValueError("content_base64 为空")
-
-    payload = base64_payload.strip()
-    if payload.startswith("data:") and "base64," in payload:
-        payload = payload.split("base64,", 1)[1]
-
-    payload = re.sub(r"\s+", "", payload)
-    try:
-        return base64.b64decode(payload, validate=True)
-    except (binascii.Error, ValueError) as e:
-        raise ValueError(f"base64 解码失败: {str(e)}") from e
-
-
 def _sanitize_upload_filename(filename: str) -> str:
     """清理上传文件名，防止路径穿越，并避免空白/逗号导致的切分问题。"""
     name = Path(filename or "").name
@@ -261,8 +238,184 @@ def _sanitize_upload_filename(filename: str) -> str:
     return name or "upload.bin"
 
 
+def _get_ctx_files_index(ctx: Any) -> Dict[str, Dict[str, Any]]:
+    """从运行时上下文中提取文件索引。"""
+    if ctx is None:
+        return {}
+
+    files = getattr(ctx, "files", None)
+    if isinstance(files, dict):
+        return files
+
+    if isinstance(files, list):
+        indexed: Dict[str, Dict[str, Any]] = {}
+        for item in files:
+            if isinstance(item, dict):
+                file_id = item.get("file_id") or item.get("id")
+                if file_id:
+                    indexed[file_id] = item
+        return indexed
+
+    return {}
+
+
+def _guess_filename(file_id: str, file_info: Optional[Dict[str, Any]]) -> str:
+    if file_info:
+        for key in ("filename", "name"):
+            if file_info.get(key):
+                return str(file_info[key])
+    if file_id:
+        return str(file_id)
+    return "upload.bin"
+
+
+async def _read_filelike(file_obj: Any) -> bytes:
+    if hasattr(file_obj, "__aenter__"):
+        async with file_obj as handle:
+            data = handle.read()
+            if inspect.isawaitable(data):
+                data = await data
+            return data
+    if hasattr(file_obj, "__enter__"):
+        with file_obj as handle:
+            data = handle.read()
+            if inspect.isawaitable(data):
+                data = await data
+            return data
+    data = file_obj.read()
+    if inspect.isawaitable(data):
+        data = await data
+    return data
+
+
+async def _read_ctx_file_bytes(
+    ctx: Any,
+    file_id: str,
+    file_info: Optional[Dict[str, Any]],
+) -> bytes:
+    """从运行时读取文件内容（read_file/open_file/path）。"""
+    if ctx is None:
+        raise RuntimeError("运行时未提供 ctx，无法读取文件")
+
+    read_file = getattr(ctx, "read_file", None)
+    if callable(read_file):
+        data = read_file(file_id)
+        if inspect.isawaitable(data):
+            data = await data
+        if isinstance(data, str):
+            config.logger.warning("read_file 返回 str，已按 UTF-8 编码为 bytes")
+            return data.encode("utf-8")
+        return data
+
+    open_file = getattr(ctx, "open_file", None)
+    if callable(open_file):
+        file_obj = open_file(file_id)
+        if inspect.isawaitable(file_obj):
+            file_obj = await file_obj
+        data = await _read_filelike(file_obj)
+        if isinstance(data, str):
+            config.logger.warning("open_file 返回 str，已按 UTF-8 编码为 bytes")
+            return data.encode("utf-8")
+        return data
+
+    if file_info and file_info.get("path"):
+        path = Path(str(file_info["path"]))
+        if not path.exists():
+            raise FileNotFoundError(f"运行时文件路径不存在: {path}")
+        return await asyncio.to_thread(path.read_bytes)
+
+    raise RuntimeError("运行时不支持读取文件（缺少 read_file/open_file/path）")
+
+
+def _parse_s3_uri(uri: str) -> tuple[str, str]:
+    parsed = urlparse(uri)
+    bucket = parsed.netloc
+    key = unquote(parsed.path.lstrip("/"))
+    if not bucket or not key:
+        raise ValueError(f"无效的对象存储 URI: {uri}")
+    return bucket, key
+
+
+async def _download_uri_to_path(uri: str, dest: Path) -> None:
+    parsed = urlparse(uri)
+    scheme = parsed.scheme.lower()
+
+    if scheme in ("http", "https"):
+        async with aiohttp.ClientSession() as session:
+            async with session.get(uri) as response:
+                response.raise_for_status()
+                data = await response.read()
+        if config.MAX_UPLOAD_BYTES > 0 and len(data) > config.MAX_UPLOAD_BYTES:
+            raise ValueError(
+                f"文件过大: {len(data)} bytes，超过限制 {config.MAX_UPLOAD_BYTES} bytes；"
+                "可通过 MINERU_MCP_MAX_UPLOAD_BYTES 调整"
+            )
+        await asyncio.to_thread(dest.write_bytes, data)
+        return
+
+    if scheme in ("s3", "minio"):
+        try:
+            import boto3
+            from botocore.config import Config as BotoConfig
+        except Exception as exc:
+            raise RuntimeError(
+                "需要 boto3 才能读取 s3/minio 对象存储，请先安装 boto3"
+            ) from exc
+
+        bucket, key = _parse_s3_uri(uri)
+        s3_config = None
+        if config.OBJECT_STORAGE_PATH_STYLE:
+            s3_config = BotoConfig(s3={"addressing_style": "path"})
+
+        client = boto3.client(
+            "s3",
+            endpoint_url=config.OBJECT_STORAGE_ENDPOINT or None,
+            aws_access_key_id=config.OBJECT_STORAGE_ACCESS_KEY or None,
+            aws_secret_access_key=config.OBJECT_STORAGE_SECRET_KEY or None,
+            region_name=config.OBJECT_STORAGE_REGION or None,
+            use_ssl=config.OBJECT_STORAGE_SECURE,
+            config=s3_config,
+        )
+        await asyncio.to_thread(client.download_file, bucket, key, str(dest))
+        if config.MAX_UPLOAD_BYTES > 0 and dest.stat().st_size > config.MAX_UPLOAD_BYTES:
+            raise ValueError(
+                f"文件过大: {dest.stat().st_size} bytes，超过限制 {config.MAX_UPLOAD_BYTES} bytes；"
+                "可通过 MINERU_MCP_MAX_UPLOAD_BYTES 调整"
+            )
+        return
+
+    raise ValueError(f"不支持的对象存储 URI scheme: {scheme}")
+
+
+async def _materialize_ctx_file(
+    ctx: Any,
+    file_id: str,
+    file_info: Optional[Dict[str, Any]],
+    upload_dir: Path,
+) -> Path:
+    """将运行时文件实体化为本地临时文件路径。"""
+    safe_name = _sanitize_upload_filename(_guess_filename(file_id, file_info))
+    dest = upload_dir / safe_name
+
+    if file_info and file_info.get("uri"):
+        config.logger.info(
+            "从对象存储下载文件: file_id=%s, uri=%s", file_id, file_info["uri"]
+        )
+        await _download_uri_to_path(str(file_info["uri"]), dest)
+        return dest
+
+    data = await _read_ctx_file_bytes(ctx, file_id, file_info)
+    if config.MAX_UPLOAD_BYTES > 0 and len(data) > config.MAX_UPLOAD_BYTES:
+        raise ValueError(
+            f"文件过大: {len(data)} bytes，超过限制 {config.MAX_UPLOAD_BYTES} bytes；"
+            "可通过 MINERU_MCP_MAX_UPLOAD_BYTES 调整"
+        )
+    await asyncio.to_thread(dest.write_bytes, data)
+    return dest
+
+
 def _build_results_response(results: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """将逐文件结果列表打包为 parse_documents 的统一返回格式。"""
+    """将逐文件结果列表打包为统一返回格式。"""
     if not results:
         return {"status": "error", "error": "未处理任何文件"}
 
@@ -907,76 +1060,6 @@ async def _process_conversion_result(
     return base_result
 
 
-@mcp.tool()
-async def parse_documents(
-    file_sources: Annotated[
-        str,
-        Field(
-            description="""文件路径或URL，支持以下格式:
-            - 单个路径或URL: "/path/to/file.pdf" 或 "https://example.com/document.pdf"
-            - 多个路径或URL(逗号分隔): "/path/to/file1.pdf, /path/to/file2.pdf" 或
-              "https://example.com/doc1.pdf, https://example.com/doc2.pdf"
-            - 混合路径和URL: "/path/to/file.pdf, https://example.com/document.pdf"
-            (支持pdf、ppt、pptx、doc、docx以及图片格式jpg、jpeg、png)"""
-        ),
-    ],
-    # 通用参数
-    enable_ocr: Annotated[bool, Field(description="启用OCR识别,默认False")] = False,
-    language: Annotated[
-        str, Field(description='文档语言，默认"ch"中文，可选"en"英文等')
-    ] = "ch",
-    # 远程API参数
-    page_ranges: Annotated[
-        str | None,
-        Field(
-            description='指定页码范围，格式为逗号分隔的字符串。例如："2,4-6"：表示选取第2页、第4页至第6页；"2--2"：表示从第2页一直选取到倒数第二页。（远程API）,默认None'
-        ),
-    ] = None,
-) -> Dict[str, Any]:
-    """
-    统一接口，将文件转换为Markdown格式。支持本地文件和URL，会根据USE_LOCAL_API配置自动选择合适的处理方式。
-
-    当USE_LOCAL_API=true时:
-    - 会过滤掉http/https开头的URL路径
-    - 对本地文件使用本地API进行解析
-
-    当USE_LOCAL_API=false时:
-    - 将http/https开头的路径使用convert_file_url处理
-    - 将其他路径使用convert_file_path处理
-
-    处理完成后，会自动尝试读取转换后的文件内容并返回。
-
-    返回:
-        成功: {"status": "success", "content": "文件内容"} 或 {"status": "success", "results": [处理结果列表]}
-        失败: {"status": "error", "error": "错误信息"}
-    """
-    # 解析路径列表
-    sources = parse_list_input(file_sources)
-    if not sources:
-        return {"status": "error", "error": "未提供有效的文件路径或URL"}
-
-    # 去重处理，使用字典来保持原始顺序
-    sources = list(dict.fromkeys(sources))
-
-    config.logger.debug(f"去重后的文件路径: {sources}")
-
-    # 记录去重信息
-    original_count = len(parse_list_input(file_sources))
-    unique_count = len(sources)
-    if original_count > unique_count:
-        config.logger.debug(
-            f"检测到重复路径，已自动去重: {original_count} -> {unique_count}"
-        )
-
-    results = await _parse_documents_from_sources_list(
-        sources,
-        enable_ocr=enable_ocr,
-        language=language,
-        page_ranges=page_ranges,
-    )
-    return _build_results_response(results)
-
-
 async def _parse_documents_from_sources_list(
     sources: List[str],
     *,
@@ -986,7 +1069,7 @@ async def _parse_documents_from_sources_list(
     extra_allowed_roots: Optional[List[Path]] = None,
     allow_paths_when_disabled: bool = False,
 ) -> List[Dict[str, Any]]:
-    """复用 parse_documents 的逻辑，但输入为已解析好的 sources 列表。"""
+    """复用解析逻辑，但输入为已解析好的 sources 列表。"""
     if not sources:
         return []
 
@@ -1227,14 +1310,14 @@ async def _parse_documents_from_sources_list(
 
 
 @mcp.tool()
-async def parse_documents_base64(
-    files: Annotated[
-        List[Dict[str, Any]],
+async def parse_documet(
+    file_ids: Annotated[
+        List[str],
         Field(
             description=(
-                "通过 base64 上传文件内容并解析（适用于远端 MCP Server 场景）。\n"
-                "格式：[{\"filename\": \"a.pdf\", \"content_base64\": \"...\"}, ...]\n"
-                "content_base64 支持 data URL 前缀（data:...;base64,xxxx）。"
+                "运行时提供的文件 ID 列表。"
+                "服务器将优先从对象存储（ctx.files[file_id].uri）下载，"
+                "否则从运行时读取文件内容。"
             )
         ),
     ],
@@ -1257,12 +1340,23 @@ async def parse_documents_base64(
             )
         ),
     ] = False,
+    ctx: Context | None = None,
 ) -> Dict[str, Any]:
     """
-    将 base64 写入服务端临时文件，然后复用 parse_documents 的解析逻辑。
+    从对象存储或运行时获取文件，落盘后复用解析逻辑。
     """
-    if not files:
-        return {"status": "error", "error": "files 不能为空"}
+    if not file_ids:
+        return {"status": "error", "error": "file_ids 不能为空"}
+
+    if ctx is None:
+        return {"status": "error", "error": "运行时未提供 ctx，无法读取文件"}
+
+    config.logger.info(
+        "parse_documet 请求: files=%s, enable_ocr=%s, language=%s",
+        len(file_ids),
+        enable_ocr,
+        language,
+    )
 
     # 在输出目录下创建一次上传会话目录（避免与解析输出目录混淆）
     base_output = config.ensure_output_dir(output_dir)
@@ -1271,51 +1365,19 @@ async def parse_documents_base64(
 
     saved_sources: List[str] = []
     pre_results: List[Dict[str, Any]] = []
+    files_index = _get_ctx_files_index(ctx)
 
     try:
-        for i, item in enumerate(files):
-            if not isinstance(item, dict):
-                pre_results.append(
-                    {
-                        "filename": f"upload_{i}",
-                        "status": "error",
-                        "error_message": "files 的每一项必须是对象",
-                    }
-                )
-                continue
-
-            safe_name = _sanitize_upload_filename(str(item.get("filename", "")))
-            content_b64 = item.get("content_base64")
-            if not isinstance(content_b64, str):
-                pre_results.append(
-                    {
-                        "filename": safe_name,
-                        "status": "error",
-                        "error_message": "缺少 content_base64 或类型不是字符串",
-                    }
-                )
-                continue
-
+        for file_id in file_ids:
+            file_info = files_index.get(file_id)
+            safe_name = _sanitize_upload_filename(_guess_filename(file_id, file_info))
             try:
-                estimated_size = _estimate_base64_decoded_size(content_b64)
-                if estimated_size > config.MAX_UPLOAD_BYTES:
-                    raise ValueError(
-                        f"文件过大: 估算 {estimated_size} bytes，超过限制 {config.MAX_UPLOAD_BYTES} bytes；"
-                        "可通过 MINERU_MCP_MAX_UPLOAD_BYTES 调整"
-                    )
-
-                data = _decode_base64_payload(content_b64)
-                if len(data) > config.MAX_UPLOAD_BYTES:
-                    raise ValueError(
-                        f"文件过大: {len(data)} bytes，超过限制 {config.MAX_UPLOAD_BYTES} bytes；"
-                        "可通过 MINERU_MCP_MAX_UPLOAD_BYTES 调整"
-                    )
-
-                # 为每个文件创建独立子目录，避免重名覆盖且保留原始文件名
-                subdir = upload_dir / f"{i:03d}"
-                subdir.mkdir(parents=True, exist_ok=True)
-                dest = subdir / safe_name
-                dest.write_bytes(data)
+                dest = await _materialize_ctx_file(
+                    ctx=ctx,
+                    file_id=file_id,
+                    file_info=file_info,
+                    upload_dir=upload_dir,
+                )
                 saved_sources.append(str(dest))
             except Exception as e:
                 pre_results.append(
@@ -1326,7 +1388,6 @@ async def parse_documents_base64(
                     }
                 )
 
-        # 解析成功落盘的文件（即使为空也允许继续，以便返回 pre_results）
         parsed_results: List[Dict[str, Any]] = []
         if saved_sources:
             parsed_results = await _parse_documents_from_sources_list(

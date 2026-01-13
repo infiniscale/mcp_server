@@ -16,6 +16,20 @@ MINERU_API_KEY = os.getenv("MINERU_API_KEY", "")
 USE_LOCAL_API = os.getenv("USE_LOCAL_API", "").lower() in ["true", "1", "yes"]
 LOCAL_MINERU_API_BASE = os.getenv("LOCAL_MINERU_API_BASE", "http://localhost:8080")
 
+# 对象存储配置（可选，用于通过 uri 拉取文件）
+OBJECT_STORAGE_ENDPOINT = os.getenv("MINERU_OBJECT_STORAGE_ENDPOINT", "")
+OBJECT_STORAGE_ACCESS_KEY = os.getenv("MINERU_OBJECT_STORAGE_ACCESS_KEY", "")
+OBJECT_STORAGE_SECRET_KEY = os.getenv("MINERU_OBJECT_STORAGE_SECRET_KEY", "")
+OBJECT_STORAGE_REGION = os.getenv("MINERU_OBJECT_STORAGE_REGION", "")
+OBJECT_STORAGE_SECURE = os.getenv("MINERU_OBJECT_STORAGE_SECURE", "").lower() not in [
+    "false",
+    "0",
+    "no",
+]
+OBJECT_STORAGE_PATH_STYLE = os.getenv(
+    "MINERU_OBJECT_STORAGE_PATH_STYLE", ""
+).lower() in ["true", "1", "yes"]
+
 # 转换后文件的默认输出目录
 DEFAULT_OUTPUT_DIR = os.getenv("OUTPUT_DIR", "./downloads")
 

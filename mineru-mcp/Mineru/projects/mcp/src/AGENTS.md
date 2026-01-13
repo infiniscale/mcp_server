@@ -22,7 +22,7 @@ Run these from `projects/mcp/`:
 ## Testing Guidelines
 - There is no dedicated test suite under `projects/mcp/` today.
 - If you add tests, place them in `projects/mcp/tests/` and run with `python -m pytest`.
-- Include at least one integration-style check (e.g., call `parse_documents` against a known sample) when changing API behavior.
+- Include at least one integration-style check (e.g., call `parse_documet` against a known sample) when changing API behavior.
 
 ## Commit & Pull Request Guidelines
 - Recent history is free-form (including Chinese summaries) with no enforced conventional format.
