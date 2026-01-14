@@ -8,9 +8,11 @@ import re
 import traceback
 import mimetypes
 import inspect
+import contextlib
 from urllib.parse import urlparse, unquote
 from pathlib import Path
 from typing import Annotated, Any, Dict, List, Optional
+from collections.abc import Mapping
 
 import aiohttp
 import uvicorn
@@ -238,32 +240,53 @@ def _sanitize_upload_filename(filename: str) -> str:
     return name or "upload.bin"
 
 
-def _get_ctx_files_index(ctx: Any) -> Dict[str, Dict[str, Any]]:
+def _file_info_value(file_info: Any, key: str) -> Any:
+    if file_info is None:
+        return None
+    if isinstance(file_info, Mapping):
+        return file_info.get(key)
+    return getattr(file_info, key, None)
+
+
+def _get_ctx_files_index(ctx: Any) -> Dict[str, Any]:
     """从运行时上下文中提取文件索引。"""
     if ctx is None:
         return {}
 
     files = getattr(ctx, "files", None)
-    if isinstance(files, dict):
-        return files
+    if isinstance(files, Mapping):
+        indexed: Dict[str, Any] = {}
+        for key, value in files.items():
+            if not key:
+                continue
+            if isinstance(value, Mapping) and not (
+                value.get("file_id") or value.get("id")
+            ):
+                value = dict(value)
+                value["file_id"] = key
+            indexed[str(key)] = value
+        return indexed
 
     if isinstance(files, list):
-        indexed: Dict[str, Dict[str, Any]] = {}
+        indexed: Dict[str, Any] = {}
         for item in files:
-            if isinstance(item, dict):
+            if isinstance(item, Mapping):
                 file_id = item.get("file_id") or item.get("id")
-                if file_id:
-                    indexed[file_id] = item
+            else:
+                file_id = getattr(item, "file_id", None) or getattr(item, "id", None)
+            if file_id:
+                indexed[str(file_id)] = item
         return indexed
 
     return {}
 
 
-def _guess_filename(file_id: str, file_info: Optional[Dict[str, Any]]) -> str:
+def _guess_filename(file_id: str, file_info: Any) -> str:
     if file_info:
         for key in ("filename", "name"):
-            if file_info.get(key):
-                return str(file_info[key])
+            value = _file_info_value(file_info, key)
+            if value:
+                return str(value)
     if file_id:
         return str(file_id)
     return "upload.bin"
@@ -291,7 +314,7 @@ async def _read_filelike(file_obj: Any) -> bytes:
 async def _read_ctx_file_bytes(
     ctx: Any,
     file_id: str,
-    file_info: Optional[Dict[str, Any]],
+    file_info: Any,
 ) -> bytes:
     """从运行时读取文件内容（read_file/open_file/path）。"""
     if ctx is None:
@@ -318,8 +341,9 @@ async def _read_ctx_file_bytes(
             return data.encode("utf-8")
         return data
 
-    if file_info and file_info.get("path"):
-        path = Path(str(file_info["path"]))
+    path_value = _file_info_value(file_info, "path")
+    if path_value:
+        path = Path(str(path_value))
         if not path.exists():
             raise FileNotFoundError(f"运行时文件路径不存在: {path}")
         return await asyncio.to_thread(path.read_bytes)
@@ -341,16 +365,30 @@ async def _download_uri_to_path(uri: str, dest: Path) -> None:
     scheme = parsed.scheme.lower()
 
     if scheme in ("http", "https"):
-        async with aiohttp.ClientSession() as session:
-            async with session.get(uri) as response:
-                response.raise_for_status()
-                data = await response.read()
-        if config.MAX_UPLOAD_BYTES > 0 and len(data) > config.MAX_UPLOAD_BYTES:
-            raise ValueError(
-                f"文件过大: {len(data)} bytes，超过限制 {config.MAX_UPLOAD_BYTES} bytes；"
-                "可通过 MINERU_MCP_MAX_UPLOAD_BYTES 调整"
-            )
-        await asyncio.to_thread(dest.write_bytes, data)
+        bytes_written = 0
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(uri) as response:
+                    response.raise_for_status()
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    with open(dest, "wb") as handle:
+                        async for chunk in response.content.iter_chunked(1024 * 1024):
+                            if not chunk:
+                                continue
+                            bytes_written += len(chunk)
+                            if (
+                                config.MAX_UPLOAD_BYTES > 0
+                                and bytes_written > config.MAX_UPLOAD_BYTES
+                            ):
+                                raise ValueError(
+                                    f"文件过大: {bytes_written} bytes，超过限制 {config.MAX_UPLOAD_BYTES} bytes；"
+                                    "可通过 MINERU_MCP_MAX_UPLOAD_BYTES 调整"
+                                )
+                            handle.write(chunk)
+        except Exception:
+            with contextlib.suppress(Exception):
+                dest.unlink(missing_ok=True)
+            raise
         return
 
     if scheme in ("s3", "minio"):
@@ -390,18 +428,19 @@ async def _download_uri_to_path(uri: str, dest: Path) -> None:
 async def _materialize_ctx_file(
     ctx: Any,
     file_id: str,
-    file_info: Optional[Dict[str, Any]],
+    file_info: Any,
     upload_dir: Path,
 ) -> Path:
     """将运行时文件实体化为本地临时文件路径。"""
     safe_name = _sanitize_upload_filename(_guess_filename(file_id, file_info))
     dest = upload_dir / safe_name
 
-    if file_info and file_info.get("uri"):
+    uri_value = _file_info_value(file_info, "uri")
+    if uri_value:
         config.logger.info(
-            "从对象存储下载文件: file_id=%s, uri=%s", file_id, file_info["uri"]
+            "从对象存储下载文件: file_id=%s, uri=%s", file_id, uri_value
         )
-        await _download_uri_to_path(str(file_info["uri"]), dest)
+        await _download_uri_to_path(str(uri_value), dest)
         return dest
 
     data = await _read_ctx_file_bytes(ctx, file_id, file_info)
