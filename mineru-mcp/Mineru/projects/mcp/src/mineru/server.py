@@ -1,6 +1,7 @@
 """MinerU File转Markdown转换的FastMCP服务器实现。"""
 
 import asyncio
+import base64
 import json
 import secrets
 import shutil
@@ -40,7 +41,7 @@ mcp = FastMCP(
     PDF、Word、PPT以及图片格式（JPG、PNG、JPEG）。
 
     系统工具:
-    parse_documet: 解析文档（从对象存储或MCP运行时获取文件并解析）
+    parse_documet: 解析文档（支持 file_id / file_url / s3_uri / base64 小文件）
     get_ocr_languages: 获取OCR支持的语言列表
     """,
 )
@@ -231,6 +232,34 @@ def parse_list_input(input_str: str) -> List[str]:
     return result
 
 
+def _normalize_str_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        items: List[str] = []
+        for item in value:
+            if item is None:
+                continue
+            item = str(item).strip()
+            if item:
+                items.append(item)
+        return items
+    if isinstance(value, str):
+        return parse_list_input(value)
+    value_str = str(value).strip()
+    return [value_str] if value_str else []
+
+
+def _normalize_file_bytes(value: Any) -> List[Dict[str, str]]:
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    return []
+
+
 def _sanitize_upload_filename(filename: str) -> str:
     """清理上传文件名，防止路径穿越，并避免空白/逗号导致的切分问题。"""
     name = Path(filename or "").name
@@ -360,6 +389,83 @@ def _parse_s3_uri(uri: str) -> tuple[str, str]:
     return bucket, key
 
 
+def _s3_endpoint_from_host(host: str) -> str:
+    if host.startswith(("http://", "https://")):
+        return host
+    scheme = "https" if config.OBJECT_STORAGE_SECURE else "http"
+    return f"{scheme}://{host}"
+
+
+def _parse_s3_like_reference(ref: str) -> tuple[str, str, Optional[str]]:
+    """解析 s3_uris 可能的输入形态。
+
+    支持：
+    - s3://bucket/key
+    - minio://bucket/key
+    - bucket/key（使用环境变量中的 OBJECT_STORAGE_* 配置）
+    - endpoint/bucket/key（endpoint 不含 scheme 时使用 OBJECT_STORAGE_SECURE 决定 http/https）
+    """
+    ref = (ref or "").strip()
+    if not ref:
+        raise ValueError("s3_uri 不能为空")
+
+    if ref.startswith(("s3://", "minio://")):
+        bucket, key = _parse_s3_uri(ref)
+        return bucket, key, None
+
+    parts = ref.lstrip("/").split("/")
+    if len(parts) < 2:
+        raise ValueError(f"无效的 s3_uri: {ref}")
+
+    # 启发式：若第一段像 host（包含 . 或 :），则按 endpoint/bucket/key 解析
+    if len(parts) >= 3 and ("." in parts[0] or ":" in parts[0]):
+        endpoint_host = parts[0]
+        bucket = parts[1]
+        key = "/".join(parts[2:])
+        return bucket, key, _s3_endpoint_from_host(endpoint_host)
+
+    bucket = parts[0]
+    key = "/".join(parts[1:])
+    return bucket, key, None
+
+
+async def _download_s3_object_to_path(
+    *,
+    bucket: str,
+    key: str,
+    dest: Path,
+    endpoint_override: Optional[str] = None,
+) -> None:
+    try:
+        import boto3
+        from botocore.config import Config as BotoConfig
+    except Exception as exc:
+        raise RuntimeError("需要 boto3 才能读取 s3/minio 对象存储，请先安装 boto3") from exc
+
+    s3_config = None
+    if config.OBJECT_STORAGE_PATH_STYLE:
+        s3_config = BotoConfig(s3={"addressing_style": "path"})
+
+    endpoint_url = endpoint_override or (config.OBJECT_STORAGE_ENDPOINT or None)
+    client = boto3.client(
+        "s3",
+        endpoint_url=endpoint_url,
+        aws_access_key_id=config.OBJECT_STORAGE_ACCESS_KEY or None,
+        aws_secret_access_key=config.OBJECT_STORAGE_SECRET_KEY or None,
+        region_name=config.OBJECT_STORAGE_REGION or None,
+        use_ssl=config.OBJECT_STORAGE_SECURE,
+        config=s3_config,
+    )
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread(client.download_file, bucket, key, str(dest))
+    if config.MAX_UPLOAD_BYTES > 0 and dest.stat().st_size > config.MAX_UPLOAD_BYTES:
+        raise ValueError(
+            f"文件过大: {dest.stat().st_size} bytes，超过限制 {config.MAX_UPLOAD_BYTES} bytes；"
+            "可通过 MINERU_MCP_MAX_UPLOAD_BYTES 调整"
+        )
+
+
 async def _download_uri_to_path(uri: str, dest: Path) -> None:
     parsed = urlparse(uri)
     scheme = parsed.scheme.lower()
@@ -392,34 +498,8 @@ async def _download_uri_to_path(uri: str, dest: Path) -> None:
         return
 
     if scheme in ("s3", "minio"):
-        try:
-            import boto3
-            from botocore.config import Config as BotoConfig
-        except Exception as exc:
-            raise RuntimeError(
-                "需要 boto3 才能读取 s3/minio 对象存储，请先安装 boto3"
-            ) from exc
-
         bucket, key = _parse_s3_uri(uri)
-        s3_config = None
-        if config.OBJECT_STORAGE_PATH_STYLE:
-            s3_config = BotoConfig(s3={"addressing_style": "path"})
-
-        client = boto3.client(
-            "s3",
-            endpoint_url=config.OBJECT_STORAGE_ENDPOINT or None,
-            aws_access_key_id=config.OBJECT_STORAGE_ACCESS_KEY or None,
-            aws_secret_access_key=config.OBJECT_STORAGE_SECRET_KEY or None,
-            region_name=config.OBJECT_STORAGE_REGION or None,
-            use_ssl=config.OBJECT_STORAGE_SECURE,
-            config=s3_config,
-        )
-        await asyncio.to_thread(client.download_file, bucket, key, str(dest))
-        if config.MAX_UPLOAD_BYTES > 0 and dest.stat().st_size > config.MAX_UPLOAD_BYTES:
-            raise ValueError(
-                f"文件过大: {dest.stat().st_size} bytes，超过限制 {config.MAX_UPLOAD_BYTES} bytes；"
-                "可通过 MINERU_MCP_MAX_UPLOAD_BYTES 调整"
-            )
+        await _download_s3_object_to_path(bucket=bucket, key=key, dest=dest)
         return
 
     raise ValueError(f"不支持的对象存储 URI scheme: {scheme}")
@@ -492,6 +572,32 @@ def _build_results_response(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             "warning_count": warning_count,
         },
     }
+
+
+def _maybe_strip_data_url(value: str) -> str:
+    """支持 data:...;base64,XXXX 的输入形态。"""
+    raw = (value or "").strip()
+    if raw.startswith("data:") and "base64," in raw:
+        return raw.split("base64,", 1)[1].strip()
+    return raw
+
+
+def _decode_base64_bytes(value: str) -> bytes:
+    raw = _maybe_strip_data_url(value)
+    if not raw:
+        raise ValueError("content_base64 不能为空")
+    raw = re.sub(r"\s+", "", raw)
+    # 兼容缺少 padding 的 base64
+    padding = (-len(raw)) % 4
+    if padding:
+        raw = raw + ("=" * padding)
+    try:
+        return base64.b64decode(raw, validate=True)
+    except Exception as exc:
+        try:
+            return base64.b64decode(raw, validate=False)
+        except Exception:
+            raise ValueError("content_base64 不是有效的 base64") from exc
 
 
 def _is_path_allowed(path: Path, extra_roots: Optional[List[Path]] = None) -> bool:
@@ -1348,18 +1454,205 @@ async def _parse_documents_from_sources_list(
     return results
 
 
+async def _parse_documents_any_input(
+    *,
+    file_ids: Any,
+    file_urls: Any,
+    s3_uris: Any,
+    file_bytes: Any,
+    enable_ocr: bool,
+    language: str,
+    page_ranges: str | None,
+    keep_uploaded_files: bool,
+    ctx: Context | None,
+) -> Dict[str, Any]:
+    normalized_file_bytes = _normalize_file_bytes(file_bytes)
+    normalized_file_ids = _normalize_str_list(file_ids)
+    normalized_file_urls = _normalize_str_list(file_urls)
+    normalized_s3_uris = _normalize_str_list(s3_uris)
+
+    if not (
+        normalized_file_bytes
+        or normalized_file_ids
+        or normalized_file_urls
+        or normalized_s3_uris
+    ):
+        return {
+            "status": "error",
+            "error": "必须提供至少一种输入：file_bytes / file_ids / file_urls / s3_uris",
+        }
+
+    config.logger.info(
+        "parse_documet 请求: file_bytes=%s, file_ids=%s, file_urls=%s, s3_uris=%s, enable_ocr=%s, language=%s",
+        len(normalized_file_bytes),
+        len(normalized_file_ids),
+        len(normalized_file_urls),
+        len(normalized_s3_uris),
+        enable_ocr,
+        language,
+    )
+
+    base_output = config.ensure_output_dir(output_dir)
+    upload_dir = base_output / "_uploads" / secrets.token_hex(12)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_sources: List[str] = []
+    pre_results: List[Dict[str, Any]] = []
+    files_index = _get_ctx_files_index(ctx)
+
+    try:
+        # 1) file_bytes（base64 直传）
+        if normalized_file_bytes:
+            for item in normalized_file_bytes:
+                filename = _sanitize_upload_filename(
+                    str(item.get("filename") or item.get("name") or "upload.bin")
+                )
+                try:
+                    content_b64 = (
+                        item.get("content_base64")
+                        or item.get("file_base64")
+                        or item.get("base64")
+                        or ""
+                    )
+                    data = _decode_base64_bytes(str(content_b64))
+                    if config.MAX_UPLOAD_BYTES > 0 and len(data) > config.MAX_UPLOAD_BYTES:
+                        raise ValueError(
+                            f"文件过大: {len(data)} bytes，超过限制 {config.MAX_UPLOAD_BYTES} bytes；"
+                            "可通过 MINERU_MCP_MAX_UPLOAD_BYTES 调整"
+                        )
+                    dest = upload_dir / filename
+                    await asyncio.to_thread(dest.write_bytes, data)
+                    saved_sources.append(str(dest))
+                except Exception as e:
+                    pre_results.append(
+                        {
+                            "filename": filename,
+                            "status": "error",
+                            "error_message": str(e),
+                        }
+                    )
+
+        # 2) file_ids（运行时已上传）
+        if normalized_file_ids:
+            if ctx is None:
+                for file_id in normalized_file_ids:
+                    pre_results.append(
+                        {
+                            "filename": _sanitize_upload_filename(str(file_id)),
+                            "status": "error",
+                            "error_message": "提供了 file_ids 但运行时未注入 ctx，无法读取已上传文件",
+                        }
+                    )
+            else:
+                for file_id in normalized_file_ids:
+                    file_info = files_index.get(file_id)
+                    safe_name = _sanitize_upload_filename(
+                        _guess_filename(file_id, file_info)
+                    )
+                    try:
+                        dest = await _materialize_ctx_file(
+                            ctx=ctx,
+                            file_id=file_id,
+                            file_info=file_info,
+                            upload_dir=upload_dir,
+                        )
+                        saved_sources.append(str(dest))
+                    except Exception as e:
+                        pre_results.append(
+                            {
+                                "filename": safe_name,
+                                "status": "error",
+                                "error_message": str(e),
+                            }
+                        )
+
+        # 3) file_urls（http(s)）
+        url_sources: List[str] = []
+        if normalized_file_urls:
+            url_sources.extend(normalized_file_urls)
+
+        # 4) s3_uris（对象存储引用）
+        if normalized_s3_uris:
+            for ref in normalized_s3_uris:
+                safe_name = _sanitize_upload_filename(Path(ref).name or "object.bin")
+                dest = upload_dir / safe_name
+                try:
+                    bucket, key, endpoint_override = _parse_s3_like_reference(ref)
+                    await _download_s3_object_to_path(
+                        bucket=bucket,
+                        key=key,
+                        dest=dest,
+                        endpoint_override=endpoint_override,
+                    )
+                    saved_sources.append(str(dest))
+                except Exception as e:
+                    pre_results.append(
+                        {
+                            "filename": safe_name,
+                            "status": "error",
+                            "error_message": str(e),
+                        }
+                    )
+
+        parsed_results: List[Dict[str, Any]] = []
+        sources = saved_sources + url_sources
+        if sources:
+            parsed_results = await _parse_documents_from_sources_list(
+                sources,
+                enable_ocr=enable_ocr,
+                language=language,
+                page_ranges=page_ranges,
+                extra_allowed_roots=[upload_dir],
+                allow_paths_when_disabled=True,
+            )
+
+        combined = pre_results + parsed_results
+        return _build_results_response(combined)
+    finally:
+        if not keep_uploaded_files:
+            shutil.rmtree(upload_dir, ignore_errors=True)
+
+
 @mcp.tool()
-async def parse_documet(
+async def parse_documents(
     file_ids: Annotated[
-        List[str],
+        List[str] | str | None,
         Field(
             description=(
-                "运行时提供的文件 ID 列表。"
-                "服务器将优先从对象存储（ctx.files[file_id].uri）下载，"
-                "否则从运行时读取文件内容。"
+                "（可选）运行时已上传的文件 ID（字符串或列表）。"
+                "通常需要运行时注入 ctx，并能通过 ctx.files/ctx.read_file/ctx.open_file 读取。"
             )
         ),
     ],
+    file_urls: Annotated[
+        List[str] | str | None,
+        Field(
+            description=(
+                "（可选）http(s) 可直接下载的文件 URL（字符串或列表）。"
+                "示例：'https://example.com/a.pdf' 或 ['https://example.com/a.pdf']"
+            )
+        ),
+    ] = None,
+    s3_uris: Annotated[
+        List[str] | str | None,
+        Field(
+            description=(
+                "（可选）对象存储引用（字符串或列表）。支持："
+                "'s3://bucket/key'、'minio://bucket/key'、'bucket/key'、'endpoint/bucket/key'。"
+                "当不带 endpoint 时使用环境变量 MINERU_OBJECT_STORAGE_ENDPOINT 等配置。"
+            )
+        ),
+    ] = None,
+    file_bytes: Annotated[
+        List[Dict[str, str]] | Dict[str, str] | None,
+        Field(
+            description=(
+                "（可选）小文件 base64 直传（单个对象或列表）。每项格式："
+                "{'filename': 'a.pdf', 'content_base64': '...'}。"
+                "大小受 MINERU_MCP_MAX_UPLOAD_BYTES 限制。"
+            )
+        ),
+    ] = None,
     enable_ocr: Annotated[bool, Field(description="启用OCR识别,默认False")] = False,
     language: Annotated[
         str, Field(description='文档语言，默认"ch"中文，可选"en"英文等')
@@ -1382,67 +1675,102 @@ async def parse_documet(
     ctx: Context | None = None,
 ) -> Dict[str, Any]:
     """
-    从对象存储或运行时获取文件，落盘后复用解析逻辑。
+    解析文档（推荐：同一工具支持多种输入，避免 LLM 只死咬 file_id）。
+
+    输入优先级（同一份文件同时提供多种形态时）：
+    1) file_bytes（base64 小文件直传）
+    2) file_ids（运行时已上传文件）
+    3) file_urls（http(s) 可下载链接）
+    4) s3_uris（对象存储引用）
     """
-    if not file_ids:
-        return {"status": "error", "error": "file_ids 不能为空"}
-
-    if ctx is None:
-        return {"status": "error", "error": "运行时未提供 ctx，无法读取文件"}
-
-    config.logger.info(
-        "parse_documet 请求: files=%s, enable_ocr=%s, language=%s",
-        len(file_ids),
-        enable_ocr,
-        language,
+    return await _parse_documents_any_input(
+        file_ids=file_ids,
+        file_urls=file_urls,
+        s3_uris=s3_uris,
+        file_bytes=file_bytes,
+        enable_ocr=enable_ocr,
+        language=language,
+        page_ranges=page_ranges,
+        keep_uploaded_files=keep_uploaded_files,
+        ctx=ctx,
     )
 
-    # 在输出目录下创建一次上传会话目录（避免与解析输出目录混淆）
-    base_output = config.ensure_output_dir(output_dir)
-    upload_dir = base_output / "_uploads" / secrets.token_hex(12)
-    upload_dir.mkdir(parents=True, exist_ok=True)
 
-    saved_sources: List[str] = []
-    pre_results: List[Dict[str, Any]] = []
-    files_index = _get_ctx_files_index(ctx)
-
-    try:
-        for file_id in file_ids:
-            file_info = files_index.get(file_id)
-            safe_name = _sanitize_upload_filename(_guess_filename(file_id, file_info))
-            try:
-                dest = await _materialize_ctx_file(
-                    ctx=ctx,
-                    file_id=file_id,
-                    file_info=file_info,
-                    upload_dir=upload_dir,
-                )
-                saved_sources.append(str(dest))
-            except Exception as e:
-                pre_results.append(
-                    {
-                        "filename": safe_name,
-                        "status": "error",
-                        "error_message": str(e),
-                    }
-                )
-
-        parsed_results: List[Dict[str, Any]] = []
-        if saved_sources:
-            parsed_results = await _parse_documents_from_sources_list(
-                saved_sources,
-                enable_ocr=enable_ocr,
-                language=language,
-                page_ranges=page_ranges,
-                extra_allowed_roots=[upload_dir],
-                allow_paths_when_disabled=True,
+@mcp.tool()
+async def parse_documet(
+    file_ids: Annotated[
+        List[str] | str | None,
+        Field(
+            description=(
+                "（可选）运行时已上传的文件 ID（字符串或列表）。"
+                "通常需要运行时注入 ctx，并能通过 ctx.files/ctx.read_file/ctx.open_file 读取。"
             )
-
-        combined = pre_results + parsed_results
-        return _build_results_response(combined)
-    finally:
-        if not keep_uploaded_files:
-            shutil.rmtree(upload_dir, ignore_errors=True)
+        ),
+    ],
+    file_urls: Annotated[
+        List[str] | str | None,
+        Field(
+            description=(
+                "（可选）http(s) 可直接下载的文件 URL（字符串或列表）。"
+                "示例：'https://example.com/a.pdf' 或 ['https://example.com/a.pdf']"
+            )
+        ),
+    ] = None,
+    s3_uris: Annotated[
+        List[str] | str | None,
+        Field(
+            description=(
+                "（可选）对象存储引用（字符串或列表）。支持："
+                "'s3://bucket/key'、'minio://bucket/key'、'bucket/key'、'endpoint/bucket/key'。"
+                "当不带 endpoint 时使用环境变量 MINERU_OBJECT_STORAGE_ENDPOINT 等配置。"
+            )
+        ),
+    ] = None,
+    file_bytes: Annotated[
+        List[Dict[str, str]] | Dict[str, str] | None,
+        Field(
+            description=(
+                "（可选）小文件 base64 直传（单个对象或列表）。每项格式："
+                "{'filename': 'a.pdf', 'content_base64': '...'}。"
+                "大小受 MINERU_MCP_MAX_UPLOAD_BYTES 限制。"
+            )
+        ),
+    ] = None,
+    enable_ocr: Annotated[bool, Field(description="启用OCR识别,默认False")] = False,
+    language: Annotated[
+        str, Field(description='文档语言，默认"ch"中文，可选"en"英文等')
+    ] = "ch",
+    page_ranges: Annotated[
+        str | None,
+        Field(
+            description='指定页码范围（远程API），格式例如 "2,4-6" 或 "2--2"，默认None'
+        ),
+    ] = None,
+    keep_uploaded_files: Annotated[
+        bool,
+        Field(
+            description=(
+                "是否保留服务端落盘的上传文件（默认False）。"
+                "开启后便于排查问题，但注意磁盘占用。"
+            )
+        ),
+    ] = False,
+    ctx: Context | None = None,
+) -> Dict[str, Any]:
+    """
+    `parse_documents` 的兼容别名（历史拼写）。
+    """
+    return await _parse_documents_any_input(
+        file_ids=file_ids,
+        file_urls=file_urls,
+        s3_uris=s3_uris,
+        file_bytes=file_bytes,
+        enable_ocr=enable_ocr,
+        language=language,
+        page_ranges=page_ranges,
+        keep_uploaded_files=keep_uploaded_files,
+        ctx=ctx,
+    )
 
 
 @mcp.tool()

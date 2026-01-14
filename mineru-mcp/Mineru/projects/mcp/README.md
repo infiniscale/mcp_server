@@ -6,7 +6,7 @@
 
 该服务器通过 MCP 协议公开了以下主要工具：
 
-1. `parse_documents`：统一接口，支持处理本地文件和URL，自动根据配置选择最合适的处理方式，并自动读取转换后的内容
+1. `parse_documents`：解析文档，支持 `file_ids`（运行时已上传）、`file_urls`（http(s)）、`s3_uris`（对象存储）、`file_bytes`（base64 小文件直传），并自动读取转换后的内容（`parse_documet` 为历史兼容别名）
 2. `get_ocr_languages`：获取OCR支持的语言列表
 
 这使得其他应用程序或 MCP 客户端能够轻松地集成 MinerU 的 文档 到 Markdown 转换功能。
@@ -115,7 +115,7 @@ pip install -e .
 
 本项目通过 MCP 协议提供以下工具：
 
-1. **parse_documents**：统一接口，支持处理本地文件和URL，根据 `USE_LOCAL_API` 配置自动选择合适的处理方式，并自动读取转换后的文件内容
+1. **parse_documents**：解析文档，支持多种输入（`file_ids`/`file_urls`/`s3_uris`/`file_bytes`），并自动读取转换后的文件内容（`parse_documet` 为兼容别名）
 2. **get_ocr_languages**：获取 OCR 支持的语言列表
 
 ### 5.2 参数说明
@@ -124,14 +124,18 @@ pip install -e .
 
 | 参数                | 类型    | 说明                                                                | 默认值   | 适用模式 |
 | ------------------- | ------- | ------------------------------------------------------------------- | -------- | -------- |
-| `file_sources`      | 字符串  | 文件路径或URL，多个可用逗号或换行符分隔 (支持pdf、ppt、pptx、doc、docx以及图片格式jpg、jpeg、png) | -        | 全部 |
+| `file_ids`          | 字符串或列表(可选) | 运行时已上传文件的 `file_id`（需要运行时注入 `ctx` 并支持读取） | `None`   | 全部 |
+| `file_urls`         | 字符串或列表(可选) | http(s) 可直接下载的 URL                                         | `None`   | 全部 |
+| `s3_uris`           | 字符串或列表(可选) | 对象存储引用：`s3://bucket/key`、`bucket/key`、`endpoint/bucket/key` | `None`   | 全部 |
+| `file_bytes`        | 对象或列表(可选) | base64 直传小文件：`{filename, content_base64}` 或 `[{...}]`（受大小限制） | `None`   | 全部 |
 | `enable_ocr`        | 布尔值  | 是否启用 OCR 功能                                                   | `false`  | 全部 |
 | `language`          | 字符串  | 文档语言，默认"ch"中文，可选"en"英文等                            | `ch`     | 全部 |
 | `page_ranges`       | 字符串 (可选) | 指定页码范围，格式为逗号分隔的字符串。例如："2,4-6"：表示选取第2页、第4页至第6页；"2--2"：表示从第2页一直选取到倒数第二页。（远程API）  | `None`   | 远程API |
 
 > **注意**：
-> - 当 `USE_LOCAL_API=true` 时，如果提供了URL，这些URL会被过滤掉，只处理本地文件路径
-> - 当 `USE_LOCAL_API=false` 时，会同时处理URL和本地文件路径
+> - 输入优先级（同一份文件同时提供多种形态时）：`file_bytes` > `file_ids` > `file_urls` > `s3_uris`
+> - 当 `USE_LOCAL_API=true` 时：URL（`file_urls`）会被忽略，仅处理本地可落盘文件（如 `file_ids`/`file_bytes`/`s3_uris`）
+> - `file_bytes` 仅适合小文件，大小受 `MINERU_MCP_MAX_UPLOAD_BYTES` 限制
 
 #### 5.2.2 get_ocr_languages
 
@@ -215,19 +219,25 @@ client = FastMCP(server_url="http://localhost:8001")
 # 使用 parse_documents 工具处理单个文档
 result = await client.tool_call(
     tool_name="parse_documents",
-    params={"file_sources": "/path/to/document.pdf"}
+    params={"file_urls": ["https://example.com/document.pdf"]}
 )
 
-# 混合处理URLs和本地文件
+# 混合处理 URL 与对象存储
 result = await client.tool_call(
     tool_name="parse_documents",
-    params={"file_sources": "/path/to/file.pdf, https://example.com/document.pdf"}
+    params={
+        "file_urls": ["https://example.com/document.pdf"],
+        "s3_uris": ["s3://mcp-files/2026/01/file_9c8f3a.pdf"],
+    }
 )
 
-# 启用OCR
+# base64 小文件直传（示例占位）
 result = await client.tool_call(
     tool_name="parse_documents",
-    params={"file_sources": "/path/to/file.pdf", "enable_ocr": True}
+    params={
+        "file_bytes": [{"filename": "a.pdf", "content_base64": "<base64...>"}],
+        "enable_ocr": True,
+    }
 )
 ```
 
@@ -330,8 +340,11 @@ docker run -p 8001:8001 --env-file .env mineru-mcp:latest
 
 ### 8.3 文件路径问题
 
-**问题**：使用 `parse_documents` 工具处理本地文件时报找不到文件错误。
-**解决方案**：请确保使用绝对路径，或者相对于服务器运行目录的正确相对路径。
+**问题**：想解析本地文件，但 MCP 服务端报“找不到文件/无法读取”。
+**解决方案**：`parse_documents` 不建议直接依赖“客户端本地路径字符串”。推荐改用以下方式之一：
+1. 运行时上传文件后使用 `file_ids`（需要 MCP runtime 能把上传文件暴露给 server）
+2. 上传到对象存储后使用 `s3_uris`
+3. 小文件使用 `file_bytes`（base64 直传）
 
 ### 8.4 MCP 服务调用超时问题
 
@@ -343,4 +356,3 @@ docker run -p 8001:8001 --env-file .env mineru-mcp:latest
 4. 增加超时时间设置（如果客户端支持）
 5. 对于超时后无法再次调用的问题，需要重启 MCP 客户端
 6. 如果反复出现超时，请检查网络连接或考虑使用本地 API 模式
-
