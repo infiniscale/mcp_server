@@ -9,6 +9,7 @@ Enhanced version with support for:
 
 import base64
 import binascii
+import json
 import os
 import re
 import secrets
@@ -21,6 +22,7 @@ import mcp.types as types
 import pypandoc
 import yaml
 from mcp.server import NotificationOptions, Server
+from mcp.server.lowlevel.server import request_ctx
 from mcp.server.models import InitializationOptions
 
 from . import config
@@ -98,6 +100,10 @@ def _decode_base64_payload(base64_payload: str) -> bytes:
         raise ValueError("content_base64 is empty")
 
     payload = base64_payload.strip()
+
+    # Check again after stripping whitespace
+    if not payload:
+        raise ValueError("content_base64 is empty")
 
     # Remove data URL prefix if present (e.g., data:application/pdf;base64,)
     if payload.startswith("data:") and "base64," in payload:
@@ -680,6 +686,43 @@ async def handle_list_tools() -> list[types.Tool]:
                 "additionalProperties": False
             },
         ),
+        types.Tool(
+            name="convert-document-resource",
+            description=(
+                "Converts documents from MCP Resource URIs. Designed for GUI clients (like Cherry Studio) "
+                "that expose uploaded files as MCP Resources.\n\n"
+                "The client must support MCP Resource protocol and expose uploaded files as Resources.\n\n"
+                "Usage:\n"
+                "- Client uploads file through GUI\n"
+                "- Client exposes file as Resource (e.g., file:///uploads/document.pdf)\n"
+                "- This tool requests the Resource content from the client\n"
+                "- Binary outputs (docx, pdf, epub, odt) are returned as base64\n\n"
+                "Supported formats: markdown, html, pdf, docx, rst, latex, epub, txt, ipynb, odt\n\n"
+                "Example: resource_uri='file:///uploads/document.pdf'"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "resource_uri": {
+                        "type": "string",
+                        "description": "MCP Resource URI (e.g., file:///uploads/document.pdf)"
+                    },
+                    "output_format": {
+                        "type": "string",
+                        "description": "Desired output format",
+                        "default": "markdown",
+                        "enum": ["markdown", "html", "pdf", "docx", "rst", "latex", "epub", "txt", "ipynb", "odt"]
+                    },
+                    "input_format": {
+                        "type": "string",
+                        "description": "Source format (optional, auto-detected from URI)",
+                        "enum": ["markdown", "html", "pdf", "docx", "rst", "latex", "epub", "txt", "ipynb", "odt"]
+                    }
+                },
+                "required": ["resource_uri"],
+                "additionalProperties": False
+            },
+        ),
     ]
 
     return tools
@@ -693,7 +736,7 @@ async def handle_call_tool(
 
     Tools can modify server state and notify clients of changes.
     """
-    if name not in ["convert-contents", "convert-contents-base64"]:
+    if name not in ["convert-contents", "convert-contents-base64", "convert-document-resource"]:
         raise ValueError(f"Unknown tool: {name}")
 
     config.logger.debug(f"Tool call: {name}, arguments: {arguments}")
@@ -705,6 +748,8 @@ async def handle_call_tool(
         return await _handle_convert_contents(arguments)
     elif name == "convert-contents-base64":
         return await _handle_convert_contents_base64(arguments)
+    elif name == "convert-document-resource":
+        return await _handle_convert_document_resource(arguments)
     else:
         raise ValueError(f"Unknown tool: {name}")
 
@@ -980,6 +1025,240 @@ async def _handle_convert_contents_base64(
             text=text_output
         )
     ]
+
+
+async def _handle_convert_document_resource(
+    arguments: dict
+) -> list[types.TextContent]:
+    """Handle convert-document-resource tool execution.
+
+    Requests file content from MCP client via Resource protocol.
+
+    Args:
+        arguments: Tool arguments containing resource_uri, output_format, input_format
+
+    Returns:
+        List of text content responses
+    """
+    resource_uri = arguments.get("resource_uri")
+    output_format = arguments.get("output_format", "markdown").lower()
+    input_format = arguments.get("input_format")
+
+    if not resource_uri:
+        return [types.TextContent(
+            type="text",
+            text=json.dumps({
+                "status": "error",
+                "error": "resource_uri is required"
+            })
+        )]
+
+    try:
+        # STEP 1: Get current request context
+        config.logger.info(f"Requesting resource from client: {resource_uri}")
+        ctx = request_ctx.get()
+        session = ctx.session
+
+        # STEP 2: Send ReadResourceRequest to CLIENT
+        read_result = await session.send_request(
+            types.ReadResourceRequest(
+                method="resources/read",
+                params=types.ReadResourceRequestParams(uri=resource_uri)
+            ),
+            types.ReadResourceResult
+        )
+
+        # STEP 3: Extract file content from response
+        file_bytes = None
+        for content in read_result.contents:
+            if isinstance(content, types.BlobResourceContents):
+                # Binary content (PDF, DOCX, images, etc.)
+                file_bytes = base64.b64decode(content.blob)
+                config.logger.debug(f"Received binary content: {len(file_bytes)} bytes")
+                break
+            elif isinstance(content, types.TextResourceContents):
+                # Text content (markdown, plain text, etc.)
+                file_bytes = content.text.encode('utf-8')
+                config.logger.debug(f"Received text content: {len(file_bytes)} bytes")
+                break
+
+        if file_bytes is None:
+            return [types.TextContent(
+                type="text",
+                text=json.dumps({
+                    "status": "error",
+                    "error": "No content found in resource"
+                })
+            )]
+
+        # STEP 4: Security validation
+        if len(file_bytes) > config.MAX_UPLOAD_BYTES:
+            return [types.TextContent(
+                type="text",
+                text=json.dumps({
+                    "status": "error",
+                    "error": f"File too large: {len(file_bytes)} bytes (limit: {config.MAX_UPLOAD_BYTES})"
+                })
+            )]
+
+        # STEP 5: Save to temporary file
+        temp_dir = config.ensure_temp_dir()
+        upload_dir = temp_dir / "_uploads" / secrets.token_hex(12)
+        upload_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            # Extract filename from URI
+            filename = Path(resource_uri).name or "document.bin"
+            filename = _sanitize_filename(filename)
+            temp_path = upload_dir / filename
+            temp_path.write_bytes(file_bytes)
+
+            config.logger.info(f"Saved resource to temp file: {temp_path}")
+
+            # STEP 6: Convert using existing logic
+            result = _convert_file_sync(
+                temp_path,
+                output_format,
+                input_format
+            )
+
+            # Format output
+            if result.get("status") == "success":
+                if result.get("content"):
+                    text_output = (
+                        f"Resource '{filename}' successfully converted to {output_format}.\n\n"
+                        f"Converted Content:\n\n{result['content']}"
+                    )
+                elif result.get("content_base64"):
+                    text_output = (
+                        f"Resource '{filename}' successfully converted to {output_format}.\n\n"
+                        f"Binary output (base64):\n{result['content_base64'][:100]}...\n"
+                        f"(Total {len(result['content_base64'])} characters)"
+                    )
+                else:
+                    text_output = f"Resource '{filename}' successfully converted to {output_format}."
+            else:
+                text_output = (
+                    f"Conversion failed for '{filename}'.\n"
+                    f"Error: {result.get('error_message', 'Unknown error')}"
+                )
+
+            return [types.TextContent(
+                type="text",
+                text=text_output
+            )]
+
+        finally:
+            # STEP 7: Cleanup temporary files
+            if upload_dir.exists():
+                try:
+                    shutil.rmtree(upload_dir)
+                    config.logger.debug(f"Cleaned up temp directory: {upload_dir}")
+                except (OSError, PermissionError) as e:
+                    config.logger.error(f"Failed to clean up temp files: {str(e)}")
+
+    except LookupError:
+        # request_ctx.get() raised LookupError - context not available
+        config.logger.error("Request context not available")
+        return [types.TextContent(
+            type="text",
+            text=json.dumps({
+                "status": "error",
+                "error": "Request context unavailable (internal error)"
+            })
+        )]
+
+    except Exception as e:
+        config.logger.error(f"Resource conversion error: {str(e)}", exc_info=True)
+        return [types.TextContent(
+            type="text",
+            text=json.dumps({
+                "status": "error",
+                "error": str(e)
+            })
+        )]
+
+
+def _convert_file_sync(
+    input_path: Path,
+    output_format: str,
+    input_format: Optional[str] = None
+) -> dict[str, Any]:
+    """Convert file synchronously using pypandoc.
+
+    Reuses existing conversion logic for Resource-based conversions.
+
+    Args:
+        input_path: Path to input file
+        output_format: Target format
+        input_format: Source format (optional, auto-detected)
+
+    Returns:
+        Dictionary with status and conversion results
+    """
+    try:
+        # Detect input format from extension if not provided
+        if not input_format:
+            ext = input_path.suffix.lower().lstrip(".")
+            input_format = INPUT_FORMAT_ALIASES.get(ext, ext) or "markdown"
+
+        # Get Pandoc-compatible format names
+        pandoc_output_format = FORMAT_ALIASES.get(output_format, output_format)
+        pandoc_input_format = INPUT_FORMAT_ALIASES.get(input_format, input_format)
+
+        config.logger.debug(
+            f"Converting {input_path.name}: {pandoc_input_format} -> {pandoc_output_format}"
+        )
+
+        # Convert using pypandoc
+        if output_format in BINARY_FORMATS:
+            # For binary formats, we need an output file
+            output_ext = output_format
+            if output_format == "latex":
+                output_ext = "tex"
+            elif output_format == "plain" or output_format == "txt":
+                output_ext = "txt"
+
+            output_path = input_path.parent / f"{input_path.stem}_output.{output_ext}"
+
+            pypandoc.convert_file(
+                str(input_path),
+                pandoc_output_format,
+                format=pandoc_input_format,
+                outputfile=str(output_path)
+            )
+
+            # Read and encode binary output
+            output_bytes = output_path.read_bytes()
+            return {
+                "status": "success",
+                "filename": input_path.name,
+                "output_format": output_format,
+                "content_base64": base64.b64encode(output_bytes).decode(),
+                "content_type": MIME_TYPES.get(output_format, f"application/{output_format}")
+            }
+        else:
+            # For text formats, convert directly
+            converted_content = pypandoc.convert_file(
+                str(input_path),
+                pandoc_output_format,
+                format=pandoc_input_format
+            )
+
+            return {
+                "status": "success",
+                "filename": input_path.name,
+                "output_format": output_format,
+                "content": converted_content
+            }
+
+    except Exception as e:
+        config.logger.error(f"Conversion error for {input_path.name}: {str(e)}", exc_info=True)
+        return {
+            "status": "error",
+            "filename": input_path.name,
+            "error_message": str(e)
+        }
 
 
 # === Server Startup Functions ===
