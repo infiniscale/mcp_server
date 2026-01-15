@@ -741,6 +741,20 @@ async def handle_call_tool(
 
     config.logger.debug(f"Tool call: {name}, arguments: {arguments}")
 
+    # Detailed logging to inspect what Cherry Studio sends
+    try:
+        ctx = request_ctx.get()
+        config.logger.info(f"=== DETAILED TOOL CALL DEBUG ===")
+        config.logger.info(f"Tool name: {name}")
+        config.logger.info(f"Arguments type: {type(arguments)}")
+        config.logger.info(f"Arguments: {json.dumps(arguments, indent=2, ensure_ascii=False)}")
+        config.logger.info(f"Request context available: {ctx is not None}")
+        if hasattr(ctx, 'meta'):
+            config.logger.info(f"Context meta: {ctx.meta}")
+        config.logger.info(f"=================================")
+    except Exception as e:
+        config.logger.warning(f"Could not log detailed context: {e}")
+
     if not arguments:
         raise ValueError("Missing arguments")
 
@@ -1060,13 +1074,26 @@ async def _handle_convert_document_resource(
         session = ctx.session
 
         # STEP 2: Send ReadResourceRequest to CLIENT
-        read_result = await session.send_request(
-            types.ReadResourceRequest(
-                method="resources/read",
-                params=types.ReadResourceRequestParams(uri=resource_uri)
-            ),
-            types.ReadResourceResult
-        )
+        config.logger.info(f"=== SENDING RESOURCE READ REQUEST ===")
+        config.logger.info(f"Resource URI: {resource_uri}")
+        config.logger.info(f"Session type: {type(session)}")
+
+        try:
+            read_result = await session.send_request(
+                types.ReadResourceRequest(
+                    method="resources/read",
+                    params=types.ReadResourceRequestParams(uri=resource_uri)
+                ),
+                types.ReadResourceResult
+            )
+            config.logger.info(f"Resource read successful, contents: {len(read_result.contents)} items")
+        except Exception as req_error:
+            config.logger.error(f"=== RESOURCE READ FAILED ===")
+            config.logger.error(f"Error type: {type(req_error).__name__}")
+            config.logger.error(f"Error message: {str(req_error)}")
+            config.logger.error(f"Full error: {repr(req_error)}")
+            config.logger.error(f"===========================")
+            raise
 
         # STEP 3: Extract file content from response
         file_bytes = None
