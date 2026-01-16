@@ -1347,15 +1347,18 @@ async def _handle_convert_document_resource(
 
         # STEP 3: Extract file content from response
         file_bytes = None
+        resource_mime_type = None
         for content in read_result.contents:
             if isinstance(content, types.BlobResourceContents):
                 # Binary content (PDF, DOCX, images, etc.)
                 file_bytes = base64.b64decode(content.blob)
+                resource_mime_type = getattr(content, "mimeType", None)
                 config.logger.debug(f"Received binary content: {len(file_bytes)} bytes")
                 break
             elif isinstance(content, types.TextResourceContents):
                 # Text content (markdown, plain text, etc.)
                 file_bytes = content.text.encode('utf-8')
+                resource_mime_type = getattr(content, "mimeType", None)
                 config.logger.debug(f"Received text content: {len(file_bytes)} bytes")
                 break
 
@@ -1392,28 +1395,73 @@ async def _handle_convert_document_resource(
 
             config.logger.info(f"Saved resource to temp file: {temp_path}")
 
-            # STEP 6: Convert using existing logic
+            # STEP 6: Infer input format from mime type if not provided
+            inferred_input_format = input_format
+            if not inferred_input_format and resource_mime_type:
+                mime_map = {
+                    "text/markdown": "markdown",
+                    "text/plain": "txt",
+                    "text/html": "html",
+                    "application/pdf": "pdf",
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+                    "application/vnd.oasis.opendocument.text": "odt",
+                    "application/epub+zip": "epub",
+                    "application/x-tex": "latex",
+                    "application/x-ipynb+json": "ipynb",
+                }
+                inferred_input_format = mime_map.get(resource_mime_type)
+
+            # STEP 7: Convert using existing logic
             result = _convert_file_sync(
                 temp_path,
                 output_format,
-                input_format
+                inferred_input_format
             )
 
             # Format output
             if result.get("status") == "success":
+                output_path = result.get("output_path")
+                minio_info = None
+                if output_path and Path(output_path).exists():
+                    minio_client = storage.get_storage()
+                    if minio_client:
+                        try:
+                            upload_result = minio_client.upload_file(
+                                Path(output_path),
+                                content_type=result.get("content_type"),
+                            )
+                            minio_info = {
+                                "uploaded": True,
+                                "download_url": upload_result["download_url"],
+                                "object_name": upload_result["object_name"],
+                                "size": upload_result["size"],
+                                "bucket": upload_result["bucket"],
+                            }
+                        except Exception as e:
+                            minio_info = {
+                                "uploaded": False,
+                                "error": str(e),
+                            }
+
+                text_output = f"Resource '{filename}' successfully converted to {output_format}.\n\n"
+                if minio_info:
+                    if minio_info.get("uploaded"):
+                        hours = max(1, config.MINIO_URL_EXPIRY // 3600)
+                        text_output += (
+                            f"Download URL (expires in {hours} hours):\n"
+                            f"{minio_info.get('download_url')}\n\n"
+                        )
+                    else:
+                        text_output += f"MinIO upload failed: {minio_info.get('error')}\n\n"
+
                 if result.get("content"):
-                    text_output = (
-                        f"Resource '{filename}' successfully converted to {output_format}.\n\n"
-                        f"Converted Content:\n\n{result['content']}"
-                    )
-                elif result.get("content_base64"):
-                    text_output = (
-                        f"Resource '{filename}' successfully converted to {output_format}.\n\n"
-                        f"Binary output (base64):\n{result['content_base64'][:100]}...\n"
+                    text_output += f"Converted Content:\n\n{result['content']}"
+                elif result.get("content_base64") and not (minio_info and minio_info.get("uploaded")):
+                    text_output += (
+                        "Binary output (base64):\n"
+                        f"{result['content_base64'][:100]}...\n"
                         f"(Total {len(result['content_base64'])} characters)"
                     )
-                else:
-                    text_output = f"Resource '{filename}' successfully converted to {output_format}."
             else:
                 text_output = (
                     f"Conversion failed for '{filename}'.\n"
@@ -1426,7 +1474,7 @@ async def _handle_convert_document_resource(
             )]
 
         finally:
-            # STEP 7: Cleanup temporary files
+            # STEP 8: Cleanup temporary files
             if upload_dir.exists():
                 try:
                     shutil.rmtree(upload_dir)
@@ -1487,47 +1535,48 @@ def _convert_file_sync(
             f"Converting {input_path.name}: {pandoc_input_format} -> {pandoc_output_format}"
         )
 
-        # Convert using pypandoc
+        # Convert using pypandoc (always write to file for MinIO upload)
+        output_ext = output_format
+        if output_format == "latex":
+            output_ext = "tex"
+        elif output_format == "plain" or output_format == "txt":
+            output_ext = "txt"
+        elif output_format == "markdown":
+            output_ext = "md"
+
+        output_path = input_path.parent / f"{input_path.stem}_output.{output_ext}"
+
+        pypandoc.convert_file(
+            str(input_path),
+            pandoc_output_format,
+            format=pandoc_input_format,
+            outputfile=str(output_path)
+        )
+
         if output_format in BINARY_FORMATS:
-            # For binary formats, we need an output file
-            output_ext = output_format
-            if output_format == "latex":
-                output_ext = "tex"
-            elif output_format == "plain" or output_format == "txt":
-                output_ext = "txt"
-
-            output_path = input_path.parent / f"{input_path.stem}_output.{output_ext}"
-
-            pypandoc.convert_file(
-                str(input_path),
-                pandoc_output_format,
-                format=pandoc_input_format,
-                outputfile=str(output_path)
-            )
-
-            # Read and encode binary output
             output_bytes = output_path.read_bytes()
             return {
                 "status": "success",
                 "filename": input_path.name,
                 "output_format": output_format,
                 "content_base64": base64.b64encode(output_bytes).decode(),
-                "content_type": MIME_TYPES.get(output_format, f"application/{output_format}")
+                "content_type": MIME_TYPES.get(output_format, f"application/{output_format}"),
+                "output_path": str(output_path),
             }
-        else:
-            # For text formats, convert directly
-            converted_content = pypandoc.convert_file(
-                str(input_path),
-                pandoc_output_format,
-                format=pandoc_input_format
-            )
 
-            return {
-                "status": "success",
-                "filename": input_path.name,
-                "output_format": output_format,
-                "content": converted_content
-            }
+        converted_content = output_path.read_text(encoding="utf-8")
+        content_type = "application/json" if output_format == "ipynb" else "text/plain"
+        if output_format in ("html", "markdown", "md"):
+            content_type = "text/html" if output_format == "html" else "text/markdown"
+
+        return {
+            "status": "success",
+            "filename": input_path.name,
+            "output_format": output_format,
+            "content": converted_content,
+            "content_type": content_type,
+            "output_path": str(output_path),
+        }
 
     except Exception as e:
         config.logger.error(f"Conversion error for {input_path.name}: {str(e)}", exc_info=True)
