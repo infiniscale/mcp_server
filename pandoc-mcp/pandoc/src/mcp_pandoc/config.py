@@ -115,6 +115,16 @@ MCP_ALLOWED_OUTPUT_ROOTS = _parse_allowed_roots(
 )
 
 
+# === MinIO Configuration ===
+MINIO_ENABLED = os.getenv("PANDOC_MINIO_ENABLED", "").lower() in ["true", "1", "yes"]
+MINIO_ENDPOINT = os.getenv("PANDOC_MINIO_ENDPOINT", "localhost:9000")
+MINIO_ACCESS_KEY = os.getenv("PANDOC_MINIO_ACCESS_KEY", "")
+MINIO_SECRET_KEY = os.getenv("PANDOC_MINIO_SECRET_KEY", "")
+MINIO_BUCKET = os.getenv("PANDOC_MINIO_BUCKET", "pandoc-conversions")
+MINIO_SECURE = os.getenv("PANDOC_MINIO_SECURE", "false").lower() in ["true", "1", "yes"]
+MINIO_URL_EXPIRY = int(os.getenv("PANDOC_MINIO_URL_EXPIRY", str(7 * 24 * 3600)))
+
+
 # === Logging Configuration ===
 LOG_LEVEL = os.getenv("PANDOC_LOG_LEVEL", "INFO").upper()
 DEBUG_MODE = os.getenv("PANDOC_DEBUG", "").lower() in ["true", "1", "yes"]
@@ -321,6 +331,11 @@ def get_config_summary() -> dict:
         "output_dir": DEFAULT_OUTPUT_DIR,
         "temp_dir": TEMP_DIR,
         "pandoc_path": PANDOC_PATH,
+        "minio_enabled": MINIO_ENABLED,
+        "minio_endpoint": MINIO_ENDPOINT,
+        "minio_bucket": MINIO_BUCKET,
+        "minio_secure": MINIO_SECURE,
+        "minio_url_expiry": MINIO_URL_EXPIRY,
         "max_upload_bytes": MAX_UPLOAD_BYTES,
         "max_file_bytes": MAX_FILE_BYTES,
         "max_upload_files": MAX_UPLOAD_FILES,

@@ -41,6 +41,18 @@ class TestToolRegistration:
         # Original tools must still exist
         assert "convert-contents" in tool_names
         assert "convert-contents-base64" in tool_names
+        assert "convert-contents-text" in tool_names
+
+    async def test_text_tool_schema(self):
+        """Test schema for convert-contents-text tool."""
+        tools = await handle_list_tools()
+        text_tool = next(t for t in tools if t.name == "convert-contents-text")
+
+        properties = text_tool.inputSchema["properties"]
+        assert "content" in properties
+        assert "filename" in properties
+        assert "output_format" in properties
+        assert text_tool.inputSchema["required"] == ["content", "filename", "output_format"]
 
 
 @pytest.mark.asyncio
@@ -148,6 +160,49 @@ class TestBackwardCompatibility:
         assert len(result) == 1
         assert result[0].type == "text"
         assert "successfully converted" in result[0].text.lower() or "<h1>" in result[0].text
+
+    async def test_convert_contents_text_still_works(self):
+        """Test that convert-contents-text tool works."""
+        content = "# Test\n\nPlain text payload."
+
+        result = await handle_call_tool(
+            name="convert-contents-text",
+            arguments={
+                "content": content,
+                "filename": "test.md",
+                "output_format": "html"
+            }
+        )
+
+        assert len(result) == 1
+        assert result[0].type == "text"
+        assert "successfully converted" in result[0].text.lower() or "<h1>" in result[0].text
+
+    @patch("mcp_pandoc.server.storage.get_storage")
+    async def test_convert_contents_text_minio_upload(self, mock_get_storage):
+        """Test convert-contents-text tool with MinIO upload."""
+        minio_client = MagicMock()
+        minio_client.upload_file.return_value = {
+            "download_url": "https://minio.example.com/download",
+            "object_name": "test.html",
+            "size": 123,
+            "bucket": "pandoc-conversions",
+        }
+        mock_get_storage.return_value = minio_client
+
+        result = await handle_call_tool(
+            name="convert-contents-text",
+            arguments={
+                "content": "# Test\n\nMinIO upload.",
+                "filename": "test.md",
+                "output_format": "html"
+            }
+        )
+
+        assert len(result) == 1
+        assert result[0].type == "text"
+        assert minio_client.upload_file.called
+        assert "Download URL" in result[0].text
 
 
 @pytest.mark.asyncio

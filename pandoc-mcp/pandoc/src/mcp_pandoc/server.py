@@ -26,6 +26,7 @@ from mcp.server.lowlevel.server import request_ctx
 from mcp.server.models import InitializationOptions
 
 from . import config
+from . import storage
 
 # Initialize server
 server = Server("mcp-pandoc")
@@ -687,6 +688,50 @@ async def handle_list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
+            name="convert-contents-text",
+            description=(
+                "Converts plain text content uploaded directly. Designed for clients that send text content "
+                "rather than base64.\n\n"
+                "Usage:\n"
+                "- Upload text content with a filename for format detection\n"
+                "- Binary outputs (docx, pdf, epub, odt) are returned as base64\n\n"
+                "Supported formats: markdown, html, pdf, docx, rst, latex, epub, txt, ipynb, odt\n\n"
+                "Example:\n"
+                '{"filename": "doc.md", "content": "# Hello", "output_format": "html"}'
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "Text content to convert"
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Original filename with extension"
+                    },
+                    "output_format": {
+                        "type": "string",
+                        "description": "Desired output format",
+                        "default": "markdown",
+                        "enum": ["markdown", "html", "pdf", "docx", "rst", "latex", "epub", "txt", "ipynb", "odt"]
+                    },
+                    "input_format": {
+                        "type": "string",
+                        "description": "Source format (optional, auto-detected from filename)",
+                        "enum": ["markdown", "html", "pdf", "docx", "rst", "latex", "epub", "txt", "ipynb", "odt"]
+                    },
+                    "keep_uploaded_files": {
+                        "type": "boolean",
+                        "description": "Keep uploaded files on server after conversion (default: false)",
+                        "default": False
+                    }
+                },
+                "required": ["content", "filename", "output_format"],
+                "additionalProperties": False
+            },
+        ),
+        types.Tool(
             name="convert-document-resource",
             description=(
                 "Converts documents from MCP Resource URIs. Designed for GUI clients (like Cherry Studio) "
@@ -736,7 +781,12 @@ async def handle_call_tool(
 
     Tools can modify server state and notify clients of changes.
     """
-    if name not in ["convert-contents", "convert-contents-base64", "convert-document-resource"]:
+    if name not in [
+        "convert-contents",
+        "convert-contents-base64",
+        "convert-contents-text",
+        "convert-document-resource",
+    ]:
         raise ValueError(f"Unknown tool: {name}")
 
     config.logger.debug(f"Tool call: {name}, arguments: {arguments}")
@@ -762,6 +812,8 @@ async def handle_call_tool(
         return await _handle_convert_contents(arguments)
     elif name == "convert-contents-base64":
         return await _handle_convert_contents_base64(arguments)
+    elif name == "convert-contents-text":
+        return await _handle_convert_contents_text(arguments)
     elif name == "convert-document-resource":
         return await _handle_convert_document_resource(arguments)
     else:
@@ -1023,6 +1075,204 @@ async def _handle_convert_contents_base64(
                 text_output += f"  [OK] {fname}\n"
                 if result.get("content"):
                     # Truncate long content
+                    content_preview = result["content"][:500]
+                    if len(result["content"]) > 500:
+                        content_preview += "...[truncated]"
+                    text_output += f"    Preview: {content_preview}\n"
+                elif result.get("content_base64"):
+                    text_output += f"    Binary output: {len(result['content_base64'])} chars (base64)\n"
+            else:
+                error_msg = result.get("error_message", "Unknown error")
+                text_output += f"  [ERROR] {fname}: {error_msg}\n"
+
+    return [
+        types.TextContent(
+            type="text",
+            text=text_output
+        )
+    ]
+
+
+async def _handle_convert_contents_text(
+    arguments: dict
+) -> list[types.TextContent]:
+    """Handle convert-contents-text tool execution.
+
+    Args:
+        arguments: Tool arguments
+
+    Returns:
+        List of text content responses
+    """
+    content = arguments.get("content")
+    raw_filename = arguments.get("filename")
+    output_format = arguments.get("output_format", "markdown").lower()
+    input_format = arguments.get("input_format")
+    keep_uploaded_files = arguments.get("keep_uploaded_files", False)
+
+    if not isinstance(content, str) or not content:
+        raise ValueError("content parameter is required and cannot be empty")
+
+    if not isinstance(raw_filename, str) or not raw_filename:
+        raise ValueError("filename parameter is required and cannot be empty")
+
+    filename = _sanitize_filename(raw_filename)
+
+    content_bytes = content.encode("utf-8")
+    if len(content_bytes) > config.MAX_UPLOAD_BYTES:
+        raise ValueError(
+            f"Content too large: {len(content_bytes)} bytes, "
+            f"limit is {config.MAX_UPLOAD_BYTES} bytes"
+        )
+
+    # Create temporary upload directory
+    temp_dir = config.ensure_temp_dir()
+    upload_dir = temp_dir / "_uploads" / secrets.token_hex(12)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    results: list[dict[str, Any]] = []
+
+    try:
+        # Save to temporary file
+        temp_path = upload_dir / filename
+        temp_path.write_text(content, encoding="utf-8")
+
+        # Determine input format from filename if not specified
+        file_input_format = input_format
+        if file_input_format:
+            file_input_format = file_input_format.lower()
+        else:
+            ext = Path(filename).suffix.lower().lstrip(".")
+            format_map = {
+                "md": "markdown",
+                "html": "html",
+                "htm": "html",
+                "txt": "txt",
+                "rst": "rst",
+                "tex": "latex",
+                "docx": "docx",
+                "odt": "odt",
+                "epub": "epub",
+                "ipynb": "ipynb",
+            }
+            file_input_format = format_map.get(ext, "markdown")
+
+        # Determine output file path
+        output_ext = output_format
+        if output_format == "latex":
+            output_ext = "tex"
+        elif output_format == "markdown":
+            output_ext = "md"
+        elif output_format == "plain" or output_format == "txt":
+            output_ext = "txt"
+
+        output_filename = f"{Path(filename).stem}.{output_ext}"
+        output_path = upload_dir / output_filename
+
+        # Convert file (skip path validation for internal temp files)
+        result = await _convert_with_pandoc(
+            input_file=str(temp_path),
+            output_file=str(output_path),
+            output_format=output_format,
+            input_format=file_input_format,
+            skip_path_validation=True,
+        )
+
+        # Read converted content based on format type
+        if output_format in BINARY_FORMATS:
+            try:
+                output_bytes = output_path.read_bytes()
+                result["content_base64"] = _encode_base64(output_bytes)
+                result["content_type"] = MIME_TYPES.get(output_format, f"application/{output_format}")
+            except (OSError, IOError) as e:
+                config.logger.error(f"Failed to read output file: {e}")
+        else:
+            try:
+                converted_content = output_path.read_text(encoding="utf-8")
+                result["content"] = converted_content
+                if output_format == "ipynb":
+                    result["content_type"] = MIME_TYPES.get("ipynb", "application/json")
+            except (OSError, UnicodeDecodeError) as e:
+                config.logger.error(f"Failed to read output file: {e}")
+
+        # Optional MinIO upload
+        if output_path.exists():
+            minio_client = storage.get_storage()
+            if minio_client:
+                try:
+                    upload_result = minio_client.upload_file(
+                        output_path,
+                        content_type=result.get("content_type"),
+                    )
+                    result["minio"] = {
+                        "uploaded": True,
+                        "download_url": upload_result["download_url"],
+                        "object_name": upload_result["object_name"],
+                        "size": upload_result["size"],
+                        "bucket": upload_result["bucket"],
+                    }
+                except Exception as e:
+                    result["minio"] = {
+                        "uploaded": False,
+                        "error": str(e),
+                    }
+
+        result["filename"] = filename
+        results.append(result)
+
+    except Exception as e:
+        results.append({
+            "filename": filename,
+            "status": "error",
+            "error_message": str(e),
+        })
+
+    finally:
+        if not keep_uploaded_files and upload_dir.exists():
+            try:
+                shutil.rmtree(upload_dir)
+            except (OSError, PermissionError) as e:
+                config.logger.error(f"Failed to clean up temporary files: {str(e)}")
+
+    response = _build_results_response(results)
+
+    if response.get("status") == "success" and len(results) == 1:
+        result = results[0]
+        text_output = f"File '{result.get('filename')}' successfully converted to {output_format}.\n\n"
+        minio_info = result.get("minio", {})
+        if minio_info.get("uploaded"):
+            hours = max(1, config.MINIO_URL_EXPIRY // 3600)
+            text_output += (
+                f"Download URL (expires in {hours} hours):\n"
+                f"{minio_info.get('download_url')}\n\n"
+            )
+        elif minio_info.get("error"):
+            text_output += f"MinIO upload failed: {minio_info.get('error')}\n\n"
+
+        if result.get("content"):
+            text_output += f"Converted Content:\n\n{result['content']}"
+        elif result.get("content_base64"):
+            text_output += (
+                "Binary output (base64):\n"
+                f"{result['content_base64'][:100]}...\n"
+                f"(Total {len(result['content_base64'])} characters)"
+            )
+    else:
+        text_output = f"Conversion results: {response['status']}\n"
+        if response.get("summary"):
+            summary = response["summary"]
+            text_output += (
+                f"Total: {summary['total_files']}, "
+                f"Success: {summary['success_count']}, "
+                f"Errors: {summary['error_count']}\n\n"
+            )
+
+        for result in results:
+            status = result.get("status", "unknown")
+            fname = result.get("filename", "unknown")
+            if status == "success":
+                text_output += f"  [OK] {fname}\n"
+                if result.get("content"):
                     content_preview = result["content"][:500]
                     if len(result["content"]) > 500:
                         content_preview += "...[truncated]"
