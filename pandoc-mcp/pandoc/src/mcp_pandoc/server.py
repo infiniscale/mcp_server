@@ -9,11 +9,13 @@ Enhanced version with support for:
 
 import base64
 import binascii
+import io
 import json
 import os
 import re
 import secrets
 import shutil
+import zipfile
 from pathlib import Path
 from typing import Any, Optional
 
@@ -56,6 +58,33 @@ MIME_TYPES = {
 # Binary formats that should be returned as base64
 # Note: ipynb is JSON text, not binary
 BINARY_FORMATS = {"pdf", "docx", "epub", "odt"}
+
+MIME_TO_INPUT_FORMAT = {
+    "text/markdown": "markdown",
+    "text/plain": "txt",
+    "text/html": "html",
+    "application/pdf": "pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/vnd.oasis.opendocument.text": "odt",
+    "application/epub+zip": "epub",
+    "application/x-tex": "latex",
+    "application/x-ipynb+json": "ipynb",
+}
+
+EXTENSION_TO_INPUT_FORMAT = {
+    "md": "markdown",
+    "markdown": "markdown",
+    "html": "html",
+    "htm": "html",
+    "txt": "txt",
+    "rst": "rst",
+    "tex": "latex",
+    "docx": "docx",
+    "odt": "odt",
+    "epub": "epub",
+    "ipynb": "ipynb",
+    "pdf": "pdf",
+}
 
 
 def set_output_dir(dir_path: str) -> str:
@@ -231,6 +260,66 @@ def _get_pandoc_format(format_name: str, is_input: bool = False) -> str:
     if is_input:
         return INPUT_FORMAT_ALIASES.get(format_lower, format_lower)
     return FORMAT_ALIASES.get(format_lower, format_lower)
+
+
+def _infer_format_from_bytes(data: bytes) -> Optional[str]:
+    """Infer input format from file signature when extension/MIME is unavailable."""
+    if not data:
+        return None
+
+    header = data[:8]
+    if header.startswith(b"%PDF-"):
+        return "pdf"
+
+    if header.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")):
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                names = set(archive.namelist())
+                if "word/document.xml" in names:
+                    return "docx"
+
+                if "mimetype" in names:
+                    mimetype = archive.read("mimetype").decode("utf-8", "ignore").strip()
+                    if mimetype == "application/epub+zip":
+                        return "epub"
+                    if mimetype == "application/vnd.oasis.opendocument.text":
+                        return "odt"
+        except zipfile.BadZipFile:
+            return None
+
+    snippet = data.lstrip()[:4096]
+    if snippet.startswith(b"{") and b"\"cells\"" in snippet:
+        return "ipynb"
+
+    return None
+
+
+def _infer_input_format(
+    provided: Optional[str],
+    filename: Optional[str],
+    mime_type: Optional[str],
+    data: Optional[bytes] = None,
+) -> str:
+    """Infer input format using explicit value, MIME, magic bytes, then extension."""
+    if provided:
+        return provided.lower()
+
+    if mime_type:
+        format_from_mime = MIME_TO_INPUT_FORMAT.get(mime_type.lower())
+        if format_from_mime:
+            return format_from_mime
+
+    if data:
+        magic_format = _infer_format_from_bytes(data)
+        if magic_format:
+            return magic_format
+
+    if filename:
+        ext = Path(filename).suffix.lower().lstrip(".")
+        if ext:
+            return EXTENSION_TO_INPUT_FORMAT.get(ext, ext)
+
+    return "markdown"
 
 
 # === Filter and Path Resolution Functions ===
@@ -1137,25 +1226,12 @@ async def _handle_convert_contents_text(
         temp_path = upload_dir / filename
         temp_path.write_text(content, encoding="utf-8")
 
-        # Determine input format from filename if not specified
-        file_input_format = input_format
-        if file_input_format:
-            file_input_format = file_input_format.lower()
-        else:
-            ext = Path(filename).suffix.lower().lstrip(".")
-            format_map = {
-                "md": "markdown",
-                "html": "html",
-                "htm": "html",
-                "txt": "txt",
-                "rst": "rst",
-                "tex": "latex",
-                "docx": "docx",
-                "odt": "odt",
-                "epub": "epub",
-                "ipynb": "ipynb",
-            }
-            file_input_format = format_map.get(ext, "markdown")
+          # Determine input format from filename if not specified
+          file_input_format = _infer_input_format(input_format, filename, None, None)
+          if file_input_format in BINARY_FORMATS:
+              raise ValueError(
+                  "Binary inputs require convert-document-resource or convert-contents-base64"
+              )
 
         # Determine output file path
         output_ext = output_format
@@ -1249,14 +1325,14 @@ async def _handle_convert_contents_text(
         elif minio_info.get("error"):
             text_output += f"MinIO upload failed: {minio_info.get('error')}\n\n"
 
-        if result.get("content"):
-            text_output += f"Converted Content:\n\n{result['content']}"
-        elif result.get("content_base64"):
-            text_output += (
-                "Binary output (base64):\n"
-                f"{result['content_base64'][:100]}...\n"
-                f"(Total {len(result['content_base64'])} characters)"
-            )
+          if result.get("content"):
+              text_output += f"Converted Content:\n\n{result['content']}"
+          elif result.get("content_base64") and not minio_info.get("uploaded"):
+              text_output += (
+                  "Binary output (base64):\n"
+                  f"{result['content_base64'][:100]}...\n"
+                  f"(Total {len(result['content_base64'])} characters)"
+              )
     else:
         text_output = f"Conversion results: {response['status']}\n"
         if response.get("summary"):
@@ -1395,21 +1471,13 @@ async def _handle_convert_document_resource(
 
             config.logger.info(f"Saved resource to temp file: {temp_path}")
 
-            # STEP 6: Infer input format from mime type if not provided
-            inferred_input_format = input_format
-            if not inferred_input_format and resource_mime_type:
-                mime_map = {
-                    "text/markdown": "markdown",
-                    "text/plain": "txt",
-                    "text/html": "html",
-                    "application/pdf": "pdf",
-                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
-                    "application/vnd.oasis.opendocument.text": "odt",
-                    "application/epub+zip": "epub",
-                    "application/x-tex": "latex",
-                    "application/x-ipynb+json": "ipynb",
-                }
-                inferred_input_format = mime_map.get(resource_mime_type)
+            # STEP 6: Infer input format with MIME, magic bytes, and filename fallback
+            inferred_input_format = _infer_input_format(
+                input_format,
+                filename,
+                resource_mime_type,
+                file_bytes,
+            )
 
             # STEP 7: Convert using existing logic
             result = _convert_file_sync(
@@ -1599,7 +1667,6 @@ def create_sse_app():
     try:
         from mcp.server.sse import SseServerTransport
         from starlette.applications import Starlette
-        from starlette.requests import Request
         from starlette.routing import Mount, Route
     except ImportError as e:
         raise ImportError(
@@ -1609,30 +1676,32 @@ def create_sse_app():
 
     sse = SseServerTransport("/messages/")
 
-    async def handle_sse(request: Request):
-        """Handle SSE connection requests."""
-        async with sse.connect_sse(
-            request.scope,
-            request.receive,
-            request._send,
-        ) as (read_stream, write_stream):
-            await server.run(
-                read_stream,
-                write_stream,
-                InitializationOptions(
-                    server_name="mcp-pandoc",
-                    server_version="0.9.0",
-                    capabilities=server.get_capabilities(
-                        notification_options=NotificationOptions(),
-                        experimental_capabilities={},
+    class SSEEndpoint:
+        """ASGI endpoint for SSE connections."""
+
+        async def __call__(self, scope, receive, send):
+            async with sse.connect_sse(
+                scope,
+                receive,
+                send,
+            ) as (read_stream, write_stream):
+                await server.run(
+                    read_stream,
+                    write_stream,
+                    InitializationOptions(
+                        server_name="mcp-pandoc",
+                        server_version="0.9.0",
+                        capabilities=server.get_capabilities(
+                            notification_options=NotificationOptions(),
+                            experimental_capabilities={},
+                        ),
                     ),
-                ),
-            )
+                )
 
     return Starlette(
         debug=config.DEBUG_MODE,
         routes=[
-            Route("/sse", endpoint=handle_sse),
+            Route("/sse", endpoint=SSEEndpoint()),
             Mount("/messages/", app=sse.handle_post_message),
         ],
     )
