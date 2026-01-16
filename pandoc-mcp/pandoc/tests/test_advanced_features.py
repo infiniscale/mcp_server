@@ -8,6 +8,7 @@ This file tests enhanced functionality beyond basic conversions:
 Focuses on testing advanced feature functionality and integration.
 """
 import os
+import re
 import sys
 import tempfile
 
@@ -124,6 +125,9 @@ class TestFilterSupport:
 
     def test_filter_file_creation_and_permissions(self):
         """Test creating filter files with proper permissions"""
+        if os.name == "nt":
+            pytest.skip("Executable permission bits are not reliable on Windows")
+
         filter_content = '''#!/usr/bin/env python3
 """
 Simple test Pandoc filter
@@ -310,8 +314,14 @@ class TestVersionUpdate:
         with open(pyproject_path) as f:
             content = f.read()
 
-        # Version should be updated correctly following semantic versioning
-        assert 'version = "0.8.1"' in content
+        # Version should match package version
+        init_path = os.path.join(os.path.dirname(__file__), '..', 'src', 'mcp_pandoc', '__init__.py')
+        with open(init_path, encoding="utf-8") as f:
+            init_content = f.read()
+        match = re.search(r'__version__\s*=\s*"([^"]+)"', init_content)
+        assert match, "Package __version__ not found"
+        package_version = match.group(1)
+        assert f'version = "{package_version}"' in content
 
         # New dependencies should be present
         assert 'pyyaml' in content
