@@ -1325,14 +1325,14 @@ async def _handle_convert_contents_text(
         elif minio_info.get("error"):
             text_output += f"MinIO upload failed: {minio_info.get('error')}\n\n"
 
-          if result.get("content"):
-              text_output += f"Converted Content:\n\n{result['content']}"
-          elif result.get("content_base64") and not minio_info.get("uploaded"):
-              text_output += (
-                  "Binary output (base64):\n"
-                  f"{result['content_base64'][:100]}...\n"
-                  f"(Total {len(result['content_base64'])} characters)"
-              )
+        if result.get("content"):
+            text_output += f"Converted Content:\n\n{result['content']}"
+        elif result.get("content_base64") and not minio_info.get("uploaded"):
+            text_output += (
+                "Binary output (base64):\n"
+                f"{result['content_base64'][:100]}...\n"
+                f"(Total {len(result['content_base64'])} characters)"
+            )
     else:
         text_output = f"Conversion results: {response['status']}\n"
         if response.get("summary"):
