@@ -1698,11 +1698,18 @@ def create_sse_app():
                     ),
                 )
 
+    class SSEPostEndpoint:
+        """ASGI endpoint for SSE message posts."""
+
+        async def __call__(self, scope, receive, send):
+            await sse.handle_post_message(scope, receive, send)
+
     return Starlette(
         debug=config.DEBUG_MODE,
         routes=[
             Route("/sse", endpoint=SSEEndpoint()),
-            Mount("/messages/", app=sse.handle_post_message),
+            Mount("/messages", app=sse.handle_post_message),
+            Mount("/sse/messages", app=SSEPostEndpoint()),
         ],
     )
 
