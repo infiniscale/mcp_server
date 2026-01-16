@@ -1226,12 +1226,12 @@ async def _handle_convert_contents_text(
         temp_path = upload_dir / filename
         temp_path.write_text(content, encoding="utf-8")
 
-          # Determine input format from filename if not specified
-          file_input_format = _infer_input_format(input_format, filename, None, None)
-          if file_input_format in BINARY_FORMATS:
-              raise ValueError(
-                  "Binary inputs require convert-document-resource or convert-contents-base64"
-              )
+        # Determine input format from filename if not specified
+        file_input_format = _infer_input_format(input_format, filename, None, None)
+        if file_input_format in BINARY_FORMATS:
+            raise ValueError(
+                "Binary inputs require convert-document-resource or convert-contents-base64"
+            )
 
         # Determine output file path
         output_ext = output_format
