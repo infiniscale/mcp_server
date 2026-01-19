@@ -1666,6 +1666,7 @@ def create_sse_app():
     """
     try:
         from mcp.server.sse import SseServerTransport
+        from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
         from starlette.applications import Starlette
         from starlette.middleware.cors import CORSMiddleware
         from starlette.routing import Mount, Route
@@ -1676,6 +1677,10 @@ def create_sse_app():
         ) from e
 
     sse = SseServerTransport("/messages/")
+    session_manager = StreamableHTTPSessionManager(
+        app=server,
+        json_response=True,
+    )
 
     class SSEEndpoint:
         """ASGI endpoint for SSE connections."""
@@ -1705,6 +1710,15 @@ def create_sse_app():
         async def __call__(self, scope, receive, send):
             await sse.handle_post_message(scope, receive, send)
 
+    from contextlib import asynccontextmanager
+    from collections.abc import AsyncIterator
+
+    @asynccontextmanager
+    async def lifespan(app: Starlette) -> AsyncIterator[None]:
+        """Manage streamable-http session manager lifecycle."""
+        async with session_manager.run():
+            yield
+
     app = Starlette(
         debug=config.DEBUG_MODE,
         routes=[
@@ -1713,7 +1727,9 @@ def create_sse_app():
             Route("/sse/", endpoint=SSEEndpoint()),
             Mount("/messages", app=sse.handle_post_message),
             Mount("/sse/messages", app=SSEPostEndpoint()),
+            Mount("/mcp", app=session_manager.handle_request),
         ],
+        lifespan=lifespan,
     )
 
     if config.CORS_ALLOW_ORIGINS:
