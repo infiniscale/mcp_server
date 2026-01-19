@@ -1707,7 +1707,9 @@ def create_sse_app():
     return Starlette(
         debug=config.DEBUG_MODE,
         routes=[
+            Route("/", endpoint=SSEEndpoint()),
             Route("/sse", endpoint=SSEEndpoint()),
+            Route("/sse/", endpoint=SSEEndpoint()),
             Mount("/messages", app=sse.handle_post_message),
             Mount("/sse/messages", app=SSEPostEndpoint()),
         ],
