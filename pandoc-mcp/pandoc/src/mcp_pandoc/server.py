@@ -324,8 +324,7 @@ def _infer_input_format(
 
 def _ensure_accept_header(scope: dict) -> dict:
     """Ensure Accept header satisfies streamable-http expectations."""
-    method = (scope.get("method") or "").upper()
-    desired = b"text/event-stream" if method == "GET" else b"application/json"
+    desired = b"application/json, text/event-stream"
     headers = list(scope.get("headers") or [])
     updated_headers = []
     accept_found = False
