@@ -1857,7 +1857,7 @@ def create_streamable_http_app():
         from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
         from starlette.applications import Starlette
         from starlette.middleware.cors import CORSMiddleware
-        from starlette.routing import Mount
+        from starlette.routing import Route
     except ImportError as e:
         raise ImportError(
             "Streamable HTTP mode requires additional dependencies. "
