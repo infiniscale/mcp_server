@@ -373,6 +373,47 @@ def _normalize_mcp_headers(scope: dict, session_manager: Any) -> dict:
     return new_scope
 
 
+async def _handle_mcp_proxy_request(scope, receive, send, session_manager):
+    """Handle /mcp requests with stateless fallback when session id is missing."""
+    from mcp.server.streamable_http import MCP_SESSION_ID_HEADER, StreamableHTTPServerTransport
+    import anyio
+
+    scope = _normalize_mcp_headers(scope, session_manager)
+    headers = list(scope.get("headers") or [])
+    session_key = MCP_SESSION_ID_HEADER.encode("utf-8")
+    has_session = any(key.lower() == session_key for key, _ in headers)
+
+    if has_session:
+        await session_manager.handle_request(scope, receive, send)
+        return
+
+    transport = StreamableHTTPServerTransport(
+        mcp_session_id=None,
+        is_json_response_enabled=session_manager.json_response,
+        event_store=None,
+        security_settings=session_manager.security_settings,
+    )
+
+    async def run_stateless_server(*, task_status=anyio.TASK_STATUS_IGNORED):
+        async with transport.connect() as streams:
+            read_stream, write_stream = streams
+            task_status.started()
+            await session_manager.app.run(
+                read_stream,
+                write_stream,
+                session_manager.app.create_initialization_options(),
+                stateless=True,
+            )
+
+    task_group = getattr(session_manager, "_task_group", None)
+    if task_group is None:
+        raise RuntimeError("StreamableHTTP session manager is not initialized.")
+
+    await task_group.start(run_stateless_server)
+    await transport.handle_request(scope, receive, send)
+    await transport.terminate()
+
+
 # === Filter and Path Resolution Functions ===
 
 
@@ -1765,8 +1806,7 @@ def create_sse_app():
         """ASGI proxy for /mcp with relaxed Accept header requirements."""
 
         async def __call__(self, scope, receive, send):
-            scope = _normalize_mcp_headers(scope, session_manager)
-            await session_manager.handle_request(scope, receive, send)
+            await _handle_mcp_proxy_request(scope, receive, send, session_manager)
 
     from contextlib import asynccontextmanager
     from collections.abc import AsyncIterator
@@ -1833,8 +1873,7 @@ def create_streamable_http_app():
         """ASGI proxy for /mcp with relaxed Accept header requirements."""
 
         async def __call__(self, scope, receive, send):
-            scope = _normalize_mcp_headers(scope, session_manager)
-            await session_manager.handle_request(scope, receive, send)
+            await _handle_mcp_proxy_request(scope, receive, send, session_manager)
 
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
