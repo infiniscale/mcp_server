@@ -1,0 +1,3 @@
+[submodule "mcp-file-system"]
+	path = mcp-file-system
+	url = https://github.com/mark3labs/mcp-filesystem-server
