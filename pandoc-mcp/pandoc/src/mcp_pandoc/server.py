@@ -1733,10 +1733,12 @@ def create_sse_app():
         async def __call__(self, scope, receive, send):
             await sse.handle_post_message(scope, receive, send)
 
-    async def handle_mcp(scope, receive, send):
-        """Handle /mcp requests with relaxed Accept header requirements."""
-        scope = _ensure_accept_header(scope)
-        await session_manager.handle_request(scope, receive, send)
+    class MCPProxy:
+        """ASGI proxy for /mcp with relaxed Accept header requirements."""
+
+        async def __call__(self, scope, receive, send):
+            scope = _ensure_accept_header(scope)
+            await session_manager.handle_request(scope, receive, send)
 
     from contextlib import asynccontextmanager
     from collections.abc import AsyncIterator
@@ -1755,8 +1757,8 @@ def create_sse_app():
             Route("/sse/", endpoint=SSEEndpoint()),
             Mount("/messages", app=sse.handle_post_message),
             Mount("/sse/messages", app=SSEPostEndpoint()),
-            Route("/mcp", endpoint=handle_mcp),
-            Route("/mcp/", endpoint=handle_mcp),
+            Route("/mcp", endpoint=MCPProxy()),
+            Route("/mcp/", endpoint=MCPProxy()),
         ],
         lifespan=lifespan,
     )
@@ -1799,10 +1801,12 @@ def create_streamable_http_app():
         json_response=True,  # Use JSON responses for better compatibility
     )
 
-    async def handle_mcp(scope, receive, send):
-        """Handle /mcp requests with relaxed Accept header requirements."""
-        scope = _ensure_accept_header(scope)
-        await session_manager.handle_request(scope, receive, send)
+    class MCPProxy:
+        """ASGI proxy for /mcp with relaxed Accept header requirements."""
+
+        async def __call__(self, scope, receive, send):
+            scope = _ensure_accept_header(scope)
+            await session_manager.handle_request(scope, receive, send)
 
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
@@ -1813,8 +1817,8 @@ def create_streamable_http_app():
     app = Starlette(
         debug=config.DEBUG_MODE,
         routes=[
-            Route("/mcp", endpoint=handle_mcp),
-            Route("/mcp/", endpoint=handle_mcp),
+            Route("/mcp", endpoint=MCPProxy()),
+            Route("/mcp/", endpoint=MCPProxy()),
         ],
         lifespan=lifespan,
     )
