@@ -322,6 +322,29 @@ def _infer_input_format(
     return "markdown"
 
 
+def _ensure_accept_header(scope: dict) -> dict:
+    """Ensure Accept header satisfies streamable-http expectations."""
+    method = (scope.get("method") or "").upper()
+    desired = b"text/event-stream" if method == "GET" else b"application/json"
+    headers = list(scope.get("headers") or [])
+    updated_headers = []
+    accept_found = False
+
+    for key, value in headers:
+        if key.lower() == b"accept":
+            updated_headers.append((key, desired))
+            accept_found = True
+        else:
+            updated_headers.append((key, value))
+
+    if not accept_found:
+        updated_headers.append((b"accept", desired))
+
+    new_scope = dict(scope)
+    new_scope["headers"] = updated_headers
+    return new_scope
+
+
 # === Filter and Path Resolution Functions ===
 
 
@@ -1710,6 +1733,11 @@ def create_sse_app():
         async def __call__(self, scope, receive, send):
             await sse.handle_post_message(scope, receive, send)
 
+    async def handle_mcp(scope, receive, send):
+        """Handle /mcp requests with relaxed Accept header requirements."""
+        scope = _ensure_accept_header(scope)
+        await session_manager.handle_request(scope, receive, send)
+
     from contextlib import asynccontextmanager
     from collections.abc import AsyncIterator
 
@@ -1727,7 +1755,8 @@ def create_sse_app():
             Route("/sse/", endpoint=SSEEndpoint()),
             Mount("/messages", app=sse.handle_post_message),
             Mount("/sse/messages", app=SSEPostEndpoint()),
-            Mount("/mcp", app=session_manager.handle_request),
+            Route("/mcp", endpoint=handle_mcp),
+            Route("/mcp/", endpoint=handle_mcp),
         ],
         lifespan=lifespan,
     )
@@ -1770,6 +1799,11 @@ def create_streamable_http_app():
         json_response=True,  # Use JSON responses for better compatibility
     )
 
+    async def handle_mcp(scope, receive, send):
+        """Handle /mcp requests with relaxed Accept header requirements."""
+        scope = _ensure_accept_header(scope)
+        await session_manager.handle_request(scope, receive, send)
+
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
         """Manage session manager lifecycle."""
@@ -1779,7 +1813,8 @@ def create_streamable_http_app():
     app = Starlette(
         debug=config.DEBUG_MODE,
         routes=[
-            Mount("/mcp", app=session_manager.handle_request),
+            Route("/mcp", endpoint=handle_mcp),
+            Route("/mcp/", endpoint=handle_mcp),
         ],
         lifespan=lifespan,
     )
