@@ -1667,6 +1667,7 @@ def create_sse_app():
     try:
         from mcp.server.sse import SseServerTransport
         from starlette.applications import Starlette
+        from starlette.middleware.cors import CORSMiddleware
         from starlette.routing import Mount, Route
     except ImportError as e:
         raise ImportError(
@@ -1704,7 +1705,7 @@ def create_sse_app():
         async def __call__(self, scope, receive, send):
             await sse.handle_post_message(scope, receive, send)
 
-    return Starlette(
+    app = Starlette(
         debug=config.DEBUG_MODE,
         routes=[
             Route("/", endpoint=SSEEndpoint()),
@@ -1714,6 +1715,18 @@ def create_sse_app():
             Mount("/sse/messages", app=SSEPostEndpoint()),
         ],
     )
+
+    if config.CORS_ALLOW_ORIGINS:
+        allow_credentials = config.CORS_ALLOW_ORIGINS != ["*"]
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=config.CORS_ALLOW_ORIGINS,
+            allow_methods=["*"],
+            allow_headers=["*"],
+            allow_credentials=allow_credentials,
+        )
+
+    return app
 
 
 def create_streamable_http_app():
@@ -1728,6 +1741,7 @@ def create_streamable_http_app():
     try:
         from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
         from starlette.applications import Starlette
+        from starlette.middleware.cors import CORSMiddleware
         from starlette.routing import Mount
     except ImportError as e:
         raise ImportError(
@@ -1746,13 +1760,25 @@ def create_streamable_http_app():
         async with session_manager.run():
             yield
 
-    return Starlette(
+    app = Starlette(
         debug=config.DEBUG_MODE,
         routes=[
             Mount("/mcp", app=session_manager.handle_request),
         ],
         lifespan=lifespan,
     )
+
+    if config.CORS_ALLOW_ORIGINS:
+        allow_credentials = config.CORS_ALLOW_ORIGINS != ["*"]
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=config.CORS_ALLOW_ORIGINS,
+            allow_methods=["*"],
+            allow_headers=["*"],
+            allow_credentials=allow_credentials,
+        )
+
+    return app
 
 
 def run_server(mode: str = "stdio", port: int = 8001, host: str = "127.0.0.1"):

@@ -115,6 +115,22 @@ MCP_ALLOWED_OUTPUT_ROOTS = _parse_allowed_roots(
 )
 
 
+# === HTTP/CORS Configuration ===
+def _parse_cors_origins(value: str) -> list[str]:
+    """Parse allowed CORS origins from environment variable."""
+    value = value.strip()
+    if not value:
+        return []
+    if value == "*":
+        return ["*"]
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+CORS_ALLOW_ORIGINS = _parse_cors_origins(
+    os.getenv("PANDOC_MCP_CORS_ALLOW_ORIGINS", "")
+)
+
+
 # === MinIO Configuration ===
 MINIO_ENABLED = os.getenv("PANDOC_MINIO_ENABLED", "").lower() in ["true", "1", "yes"]
 MINIO_ENDPOINT = os.getenv("PANDOC_MINIO_ENDPOINT", "localhost:9000")
@@ -346,6 +362,7 @@ def get_config_summary() -> dict:
         "restrict_output_dir": MCP_RESTRICT_OUTPUT_DIR,
         "allowed_input_roots": [str(p) for p in MCP_ALLOWED_INPUT_ROOTS],
         "allowed_output_roots": [str(p) for p in MCP_ALLOWED_OUTPUT_ROOTS],
+        "cors_allow_origins": CORS_ALLOW_ORIGINS,
         "log_level": LOG_LEVEL,
         "debug_mode": DEBUG_MODE,
     }
