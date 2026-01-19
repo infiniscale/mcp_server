@@ -161,6 +161,19 @@ def setup_logging() -> logging.Logger:
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
 
+    class _SuppressClosedResourceError(logging.Filter):
+        """Suppress noisy ClosedResourceError logs from streamable HTTP."""
+
+        def filter(self, record: logging.LogRecord) -> bool:
+            exc = record.exc_info[1] if record.exc_info else None
+            if exc and exc.__class__.__name__ == "ClosedResourceError":
+                return False
+            return True
+
+    logging.getLogger("mcp.server.streamable_http").addFilter(
+        _SuppressClosedResourceError()
+    )
+
     return logging.getLogger("pandoc")
 
 
