@@ -345,6 +345,34 @@ def _ensure_accept_header(scope: dict) -> dict:
     return new_scope
 
 
+def _normalize_mcp_headers(scope: dict, session_manager: Any) -> dict:
+    """Normalize streamable-http headers to tolerate stale session ids."""
+    from mcp.server.streamable_http import MCP_SESSION_ID_HEADER
+
+    scope = _ensure_accept_header(scope)
+    headers = list(scope.get("headers") or [])
+    normalized_headers = []
+    session_key = MCP_SESSION_ID_HEADER.encode("utf-8")
+
+    for key, value in headers:
+        if key.lower() == session_key:
+            try:
+                session_id = value.decode("utf-8")
+            except Exception:
+                session_id = ""
+
+            if session_id and session_id in getattr(session_manager, "_server_instances", {}):
+                normalized_headers.append((key, value))
+            # Drop invalid or empty session ids to allow new session creation
+            continue
+
+        normalized_headers.append((key, value))
+
+    new_scope = dict(scope)
+    new_scope["headers"] = normalized_headers
+    return new_scope
+
+
 # === Filter and Path Resolution Functions ===
 
 
@@ -1737,7 +1765,7 @@ def create_sse_app():
         """ASGI proxy for /mcp with relaxed Accept header requirements."""
 
         async def __call__(self, scope, receive, send):
-            scope = _ensure_accept_header(scope)
+            scope = _normalize_mcp_headers(scope, session_manager)
             await session_manager.handle_request(scope, receive, send)
 
     from contextlib import asynccontextmanager
@@ -1805,7 +1833,7 @@ def create_streamable_http_app():
         """ASGI proxy for /mcp with relaxed Accept header requirements."""
 
         async def __call__(self, scope, receive, send):
-            scope = _ensure_accept_header(scope)
+            scope = _normalize_mcp_headers(scope, session_manager)
             await session_manager.handle_request(scope, receive, send)
 
     @asynccontextmanager
