@@ -583,11 +583,13 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     transport_env = (os.getenv("MCP_TRANSPORT") or "").strip().lower()
     if not transport_env:
         transport_env = "stdio"
+    if transport_env in ("http", "streamable", "streamable-http"):
+        transport_env = "streamable_http"
     parser.add_argument(
         "--transport",
-        choices=["stdio", "sse"],
+        choices=["stdio", "sse", "streamable_http"],
         default=transport_env,
-        help="MCP transport. stdio=default, sse=HTTP Server-Sent Events",
+        help="MCP transport. stdio=default, sse=HTTP Server-Sent Events, streamable_http=single HTTP endpoint",
     )
     parser.add_argument(
         "--host",
@@ -609,6 +611,11 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--messages-path",
         default=os.getenv("MCP_MESSAGES_PATH", "/messages/"),
         help="Message endpoint path prefix (POST) when using --transport sse",
+    )
+    parser.add_argument(
+        "--http-path",
+        default=os.getenv("MCP_HTTP_PATH", "/"),
+        help="HTTP endpoint path when using --transport streamable_http (default: /).",
     )
     parser.add_argument(
         "--root-path",
@@ -634,6 +641,34 @@ def _init_options() -> InitializationOptions:
     )
 
 
+def _ensure_leading_slash(path: str) -> str:
+    p = (path or "").strip()
+    if not p:
+        return "/"
+    return p if p.startswith("/") else f"/{p}"
+
+
+def _ensure_trailing_slash(path: str) -> str:
+    p = _ensure_leading_slash(path)
+    return p if p.endswith("/") else f"{p}/"
+
+
+def _alt_without_trailing_slash(path: str) -> str:
+    p = _ensure_leading_slash(path)
+    if p == "/":
+        return "/"
+    return p.rstrip("/")
+
+
+def _infer_root_path_from_headers(request) -> str:
+    # Common reverse-proxy conventions. When present, this avoids needing explicit --root-path.
+    for name in ("x-forwarded-prefix", "x-script-name", "x-forwarded-path-prefix"):
+        value = request.headers.get(name)
+        if value:
+            return _alt_without_trailing_slash(value)
+    return ""
+
+
 async def _run_stdio() -> None:
     await main()
 
@@ -645,24 +680,64 @@ async def _run_sse(*, host: str, port: int, sse_path: str, messages_path: str, r
     from starlette.routing import Mount, Route
     import uvicorn
 
-    transport = SseServerTransport(messages_path)
+    sse_path = _alt_without_trailing_slash(sse_path)
+    sse_path_slash = _ensure_trailing_slash(sse_path)
+
+    # The MCP SSE transport publishes an endpoint like "/messages/?session_id=...".
+    # Some proxies/clients normalize away the trailing slash, so we mount both.
+    messages_path_slash = _ensure_trailing_slash(messages_path)
+    messages_path_noslash = _alt_without_trailing_slash(messages_path_slash)
+
+    transport = SseServerTransport(messages_path_slash)
 
     async def handle_sse(request):
-        async with transport.connect_sse(request.scope, request.receive, request._send) as streams:
+        effective_root_path = root_path or _infer_root_path_from_headers(request)
+        scope = dict(request.scope)
+        if effective_root_path:
+            scope["root_path"] = effective_root_path
+        async with transport.connect_sse(scope, request.receive, request._send) as streams:
             await server.run(streams[0], streams[1], _init_options())
         return Response()
 
-    app = Starlette(
-        routes=[
-            Route(sse_path, endpoint=handle_sse, methods=["GET"]),
-            Mount(messages_path, app=transport.handle_post_message),
-        ]
-    )
+    routes = [Route(sse_path, endpoint=handle_sse, methods=["GET"])]
+    if sse_path_slash != sse_path:
+        routes.append(Route(sse_path_slash, endpoint=handle_sse, methods=["GET"]))
+
+    routes.append(Mount(messages_path_slash, app=transport.handle_post_message))
+    if messages_path_noslash != messages_path_slash:
+        routes.append(Mount(messages_path_noslash, app=transport.handle_post_message))
+
+    app = Starlette(routes=routes)
 
     uvicorn_server = uvicorn.Server(
         uvicorn.Config(app, host=host, port=port, log_level="info", root_path=root_path)
     )
     await uvicorn_server.serve()
+
+
+async def _run_streamable_http(*, host: str, port: int, http_path: str, root_path: str) -> None:
+    import anyio
+    import uvicorn
+    from mcp.server.streamable_http import StreamableHTTPServerTransport
+    from starlette.applications import Starlette
+    from starlette.routing import Mount
+
+    http_path = _ensure_leading_slash(http_path)
+
+    # Mount at "/" by default so clients posting to the base URL won't 404.
+    # If you want to restrict it, set MCP_HTTP_PATH=/mcp and configure the client accordingly.
+    transport = StreamableHTTPServerTransport(mcp_session_id=None)
+    app = Starlette(routes=[Mount(http_path, app=transport.handle_request)])
+
+    uvicorn_server = uvicorn.Server(
+        uvicorn.Config(app, host=host, port=port, log_level="info", root_path=root_path)
+    )
+
+    async with transport.connect() as streams:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(server.run, streams[0], streams[1], _init_options())
+            await uvicorn_server.serve()
+            tg.cancel_scope.cancel()
 
 
 def main_cli(argv: Optional[List[str]] = None) -> None:
@@ -678,6 +753,7 @@ def main_cli(argv: Optional[List[str]] = None) -> None:
                     "port": args.port,
                     "sse_path": args.sse_path,
                     "messages_path": args.messages_path,
+                    "http_path": args.http_path,
                     "root_path": args.root_path,
                 },
                 ensure_ascii=False,
@@ -686,6 +762,16 @@ def main_cli(argv: Optional[List[str]] = None) -> None:
         return
     if args.transport == "stdio":
         asyncio.run(_run_stdio())
+        return
+    if args.transport == "streamable_http":
+        asyncio.run(
+            _run_streamable_http(
+                host=args.host,
+                port=args.port,
+                http_path=args.http_path,
+                root_path=args.root_path,
+            )
+        )
         return
     asyncio.run(
         _run_sse(

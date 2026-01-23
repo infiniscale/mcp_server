@@ -69,8 +69,13 @@ docker build --build-arg INSTALL_LIBREOFFICE=1 -t mcp-convert-router:latest .
 如果你希望服务通过 HTTP 方式对外提供（便于容器化部署/探活/端口暴露），可以用 SSE 传输：
 
 ```bash
-docker run --rm -p 8000:8000 mcp-convert-router:latest
+docker run --rm -p 8000:8000 -e MCP_TRANSPORT=sse mcp-convert-router:latest
 ```
+
+SSE 模式会暴露两个 HTTP 路由（两者都必须能被客户端访问到，否则容易出现 `Error POSTing to endpoint (HTTP 404)`）：
+
+- `GET /sse`：建立 SSE 连接
+- `POST /messages`（或 `/messages/`）：客户端消息投递端点（由服务在 SSE 握手里返回）
 
 也可以显式指定参数：
 
@@ -84,6 +89,22 @@ docker run --rm -p 8000:8000 mcp-convert-router:latest --transport sse --host 0.
 docker run --rm -p 8000:8000 mcp-convert-router:latest --transport sse --root-path /mcp
 ```
 
+或者让网关在转发时设置 `X-Forwarded-Prefix: /mcp`（服务会自动识别该头部来生成正确的消息投递地址）。
+
+### 5.1 Docker 运行（Streamable HTTP，监听端口）
+
+更适合“HTTP 客户端直接 POST 到服务地址”的场景（现代 MCP 客户端通常优先用它）。本镜像默认就是该模式：
+
+```bash
+docker run --rm -p 8000:8000 mcp-convert-router:latest
+```
+
+如果你不想挂在根路径 `/`，可以限制到 `/mcp`（客户端也必须指向该路径）：
+
+```bash
+docker run --rm -p 8000:8000 -e MCP_HTTP_PATH=/mcp mcp-convert-router:latest
+```
+
 ### 6. 启动参数自检（双重验证）
 
 你可以用 `--dry-run` 在不真正启动服务的情况下，确认“代码解析到的最终配置”和“容器入口参数”：
@@ -91,6 +112,12 @@ docker run --rm -p 8000:8000 mcp-convert-router:latest --transport sse --root-pa
 ```bash
 python -m mcp_convert_router.server --dry-run
 docker run --rm mcp-convert-router:latest --dry-run
+```
+
+### 7. 一键验证脚本（避免 404/502）
+
+```bash
+python mcp_convert_router/verify_mcp_deploy.py --base-url http://127.0.0.1:8000
 ```
 
 ## 使用示例

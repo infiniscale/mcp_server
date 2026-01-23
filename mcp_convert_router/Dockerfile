@@ -42,9 +42,10 @@ USER app
 # SSE mode listens on MCP_PORT (default 8000). stdio mode does not listen on a port.
 EXPOSE 8000
 
-# Default to SSE in containers (so an HTTP client won't hit a non-listening port).
-ENV MCP_TRANSPORT=sse \
+# Default to Streamable HTTP in containers (modern clients often POST to the base URL).
+ENV MCP_TRANSPORT=streamable_http \
     MCP_HOST=0.0.0.0 \
-    MCP_PORT=8000
+    MCP_PORT=8000 \
+    MCP_HTTP_PATH=/
 
 ENTRYPOINT ["python", "-m", "mcp_convert_router.server"]
