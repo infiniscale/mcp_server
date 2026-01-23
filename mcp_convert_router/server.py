@@ -6,6 +6,7 @@
   - `python -m mcp_convert_router.server`
 """
 
+import argparse
 import asyncio
 import os
 import traceback
@@ -568,21 +569,120 @@ async def handle_health() -> list[types.TextContent]:
 
 
 async def main():
-    """运行 MCP Server。"""
+    """运行 MCP Server（stdio）。"""
     async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
         await server.run(
             read_stream,
             write_stream,
-            InitializationOptions(
-                server_name="mcp-convert-router",
-                server_version="0.1.0",
-                capabilities=server.get_capabilities(
-                    notification_options=NotificationOptions(),
-                    experimental_capabilities={},
-                ),
-            ),
+            _init_options(),
         )
 
 
+def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="mcp-convert-router")
+    transport_env = (os.getenv("MCP_TRANSPORT") or "").strip().lower()
+    if not transport_env:
+        transport_env = "stdio"
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "sse"],
+        default=transport_env,
+        help="MCP transport. stdio=default, sse=HTTP Server-Sent Events",
+    )
+    parser.add_argument(
+        "--host",
+        default=os.getenv("MCP_HOST", "0.0.0.0"),
+        help="Host to bind when using --transport sse",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.getenv("MCP_PORT", "8000")),
+        help="Port to listen on when using --transport sse",
+    )
+    parser.add_argument(
+        "--sse-path",
+        default=os.getenv("MCP_SSE_PATH", "/sse"),
+        help="SSE endpoint path (GET) when using --transport sse",
+    )
+    parser.add_argument(
+        "--messages-path",
+        default=os.getenv("MCP_MESSAGES_PATH", "/messages/"),
+        help="Message endpoint path prefix (POST) when using --transport sse",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print resolved config and exit without starting the server",
+    )
+    return parser.parse_args(argv)
+
+
+def _init_options() -> InitializationOptions:
+    return InitializationOptions(
+        server_name="mcp-convert-router",
+        server_version="0.1.0",
+        capabilities=server.get_capabilities(
+            notification_options=NotificationOptions(),
+            experimental_capabilities={},
+        ),
+    )
+
+
+async def _run_stdio() -> None:
+    await main()
+
+
+async def _run_sse(*, host: str, port: int, sse_path: str, messages_path: str) -> None:
+    from mcp.server.sse import SseServerTransport
+    from starlette.applications import Starlette
+    from starlette.responses import Response
+    from starlette.routing import Mount, Route
+    import uvicorn
+
+    transport = SseServerTransport(messages_path)
+
+    async def handle_sse(request):
+        async with transport.connect_sse(request.scope, request.receive, request._send) as streams:
+            await server.run(streams[0], streams[1], _init_options())
+        return Response()
+
+    app = Starlette(
+        routes=[
+            Route(sse_path, endpoint=handle_sse, methods=["GET"]),
+            Mount(messages_path, app=transport.handle_post_message),
+        ]
+    )
+
+    uvicorn_server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="info"))
+    await uvicorn_server.serve()
+
+
+def main_cli(argv: Optional[List[str]] = None) -> None:
+    args = _parse_args(argv)
+    if args.dry_run:
+        import json
+
+        print(
+            json.dumps(
+                {
+                    "transport": args.transport,
+                    "host": args.host,
+                    "port": args.port,
+                    "sse_path": args.sse_path,
+                    "messages_path": args.messages_path,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return
+    if args.transport == "stdio":
+        asyncio.run(_run_stdio())
+        return
+    asyncio.run(
+        _run_sse(host=args.host, port=args.port, sse_path=args.sse_path, messages_path=args.messages_path)
+    )
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main_cli()

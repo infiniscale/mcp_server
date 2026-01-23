@@ -48,7 +48,7 @@ python -m mcp_convert_router.server
 
 ### 4. Docker 运行（stdio）
 
-> 说明：本服务使用 MCP 的 stdio 传输方式，容器运行时需要保持 stdin 打开（`docker run -i`）。
+> 说明：本服务默认使用 MCP 的 stdio 传输方式，容器运行时需要保持 stdin 打开（`docker run -i`），此模式**不监听端口**。
 
 ```bash
 cd mcp_convert_router
@@ -62,6 +62,20 @@ docker run --rm -i -v /path/to/files:/data:ro mcp-convert-router:latest
 
 # 需要旧格式 doc/xls/ppt 转换（体积会变大）
 docker build --build-arg INSTALL_LIBREOFFICE=1 -t mcp-convert-router:latest .
+```
+
+### 5. Docker 运行（SSE，监听端口）
+
+如果你希望服务通过 HTTP 方式对外提供（便于容器化部署/探活/端口暴露），可以用 SSE 传输：
+
+```bash
+docker run --rm -p 8000:8000 mcp-convert-router:latest --transport sse --host 0.0.0.0 --port 8000
+```
+
+也可以用环境变量提供默认值（代码会读取 `MCP_TRANSPORT/MCP_HOST/MCP_PORT` 等；本镜像默认 `CMD` 是 stdio，所以仍需显式传 `--transport sse` 覆盖）：
+
+```bash
+docker run --rm -p 8000:8000 -e MCP_HOST=0.0.0.0 -e MCP_PORT=8000 mcp-convert-router:latest --transport sse
 ```
 
 ## 使用示例

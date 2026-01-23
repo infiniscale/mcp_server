@@ -1,12 +1,14 @@
 FROM python:3.12-slim
 
+ARG APP_HOME=/app
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
-    PYTHONPATH=/app
+    PYTHONPATH=${APP_HOME}
 
-WORKDIR /app
+WORKDIR ${APP_HOME}
 
 # Optional features:
 # - INSTALL_LIBREOFFICE=1 enables legacy Office conversion via soffice (large image)
@@ -29,14 +31,17 @@ RUN set -eux; \
     addgroup --system app; \
     adduser --system --ingroup app app
 
-COPY requirements.txt /app/requirements.txt
-RUN pip install -r /app/requirements.txt
+COPY requirements.txt ${APP_HOME}/requirements.txt
+RUN pip install -r ${APP_HOME}/requirements.txt
 
-COPY . /app/mcp_convert_router
-RUN chown -R app:app /app
+COPY . ${APP_HOME}/mcp_convert_router
+RUN chown -R app:app ${APP_HOME}
 
 USER app
 
-# MCP stdio transport: keep stdin open when running the container (e.g. docker run -i ...)
-CMD ["python", "-m", "mcp_convert_router.server"]
+# SSE mode listens on MCP_PORT (default 8000). stdio mode does not listen on a port.
+EXPOSE 8000
 
+ENTRYPOINT ["python", "-m", "mcp_convert_router.server"]
+# Default to stdio: keep stdin open when running the container (e.g. docker run -i ...)
+CMD ["--transport", "stdio"]
