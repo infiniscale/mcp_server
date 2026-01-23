@@ -109,8 +109,8 @@ async def handle_list_tools() -> list[types.Tool]:
                     },
                     "croc_timeout_seconds": {
                         "type": "number",
-                        "default": 120,
-                        "description": "croc 接收超时时间（秒），默认 120 秒"
+                        "default": 300,
+                        "description": "croc 接收超时时间（秒），默认 300 秒"
                     }
                 },
                 "additionalProperties": False
@@ -247,7 +247,7 @@ async def handle_convert_to_markdown(args: Dict[str, Any]) -> list[types.TextCon
         elif source_type == "croc_code":
             # croc 接收
             from .croc_receiver import receive_file_via_croc
-            timeout_seconds = args.get("croc_timeout_seconds", 120)
+            timeout_seconds = args.get("croc_timeout_seconds", 300)
             max_file_mb = args.get("max_file_mb", 50)
             if "croc_timeout_seconds" not in args:
                 try:

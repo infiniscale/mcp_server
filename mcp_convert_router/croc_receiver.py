@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # 默认 croc 超时时间（秒）
-DEFAULT_CROC_TIMEOUT = 120
+DEFAULT_CROC_TIMEOUT = 300
 
 # 默认最大文件大小（字节）
 DEFAULT_MAX_FILE_BYTES = 50 * 1024 * 1024  # 50MB

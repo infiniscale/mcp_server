@@ -16,7 +16,7 @@
 
 ```bash
 # 基础依赖
-pip install mcp pypandoc pyyaml openpyxl httpx
+pip install mcp httpx openpyxl
 
 # 确保 Pandoc 已安装
 pandoc --version
@@ -42,8 +42,26 @@ export LOCAL_MINERU_API_BASE="http://localhost:8080"
 ### 3. 运行服务
 
 ```bash
+# 在仓库根目录运行（推荐）
+python -m mcp_convert_router.server
+```
+
+### 4. Docker 运行（stdio）
+
+> 说明：本服务使用 MCP 的 stdio 传输方式，容器运行时需要保持 stdin 打开（`docker run -i`）。
+
+```bash
 cd mcp_convert_router
-python server.py
+docker build -t mcp-convert-router:latest .
+
+# 仅 URL 模式（不需要挂载本地文件目录）
+docker run --rm -i mcp-convert-router:latest
+
+# 本地文件模式（把宿主机目录挂载到容器内，例如挂载到 /data）
+docker run --rm -i -v /path/to/files:/data:ro mcp-convert-router:latest
+
+# 需要旧格式 doc/xls/ppt 转换（体积会变大）
+docker build --build-arg INSTALL_LIBREOFFICE=1 -t mcp-convert-router:latest .
 ```
 
 ## 使用示例
