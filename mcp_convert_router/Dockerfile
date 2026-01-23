@@ -42,6 +42,9 @@ USER app
 # SSE mode listens on MCP_PORT (default 8000). stdio mode does not listen on a port.
 EXPOSE 8000
 
+# Default to SSE in containers (so an HTTP client won't hit a non-listening port).
+ENV MCP_TRANSPORT=sse \
+    MCP_HOST=0.0.0.0 \
+    MCP_PORT=8000
+
 ENTRYPOINT ["python", "-m", "mcp_convert_router.server"]
-# Default to stdio: keep stdin open when running the container (e.g. docker run -i ...)
-CMD ["--transport", "stdio"]

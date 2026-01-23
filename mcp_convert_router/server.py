@@ -611,6 +611,11 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Message endpoint path prefix (POST) when using --transport sse",
     )
     parser.add_argument(
+        "--root-path",
+        default=os.getenv("MCP_ROOT_PATH", ""),
+        help="External URL path prefix when behind a reverse proxy (e.g. /mcp). Used by SSE endpoint discovery.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print resolved config and exit without starting the server",
@@ -633,7 +638,7 @@ async def _run_stdio() -> None:
     await main()
 
 
-async def _run_sse(*, host: str, port: int, sse_path: str, messages_path: str) -> None:
+async def _run_sse(*, host: str, port: int, sse_path: str, messages_path: str, root_path: str) -> None:
     from mcp.server.sse import SseServerTransport
     from starlette.applications import Starlette
     from starlette.responses import Response
@@ -654,7 +659,9 @@ async def _run_sse(*, host: str, port: int, sse_path: str, messages_path: str) -
         ]
     )
 
-    uvicorn_server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="info"))
+    uvicorn_server = uvicorn.Server(
+        uvicorn.Config(app, host=host, port=port, log_level="info", root_path=root_path)
+    )
     await uvicorn_server.serve()
 
 
@@ -671,6 +678,7 @@ def main_cli(argv: Optional[List[str]] = None) -> None:
                     "port": args.port,
                     "sse_path": args.sse_path,
                     "messages_path": args.messages_path,
+                    "root_path": args.root_path,
                 },
                 ensure_ascii=False,
             )
@@ -680,7 +688,13 @@ def main_cli(argv: Optional[List[str]] = None) -> None:
         asyncio.run(_run_stdio())
         return
     asyncio.run(
-        _run_sse(host=args.host, port=args.port, sse_path=args.sse_path, messages_path=args.messages_path)
+        _run_sse(
+            host=args.host,
+            port=args.port,
+            sse_path=args.sse_path,
+            messages_path=args.messages_path,
+            root_path=args.root_path,
+        )
     )
 
 

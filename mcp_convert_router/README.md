@@ -55,10 +55,10 @@ cd mcp_convert_router
 docker build -t mcp-convert-router:latest .
 
 # 仅 URL 模式（不需要挂载本地文件目录）
-docker run --rm -i mcp-convert-router:latest
+docker run --rm -i -e MCP_TRANSPORT=stdio mcp-convert-router:latest
 
 # 本地文件模式（把宿主机目录挂载到容器内，例如挂载到 /data）
-docker run --rm -i -v /path/to/files:/data:ro mcp-convert-router:latest
+docker run --rm -i -e MCP_TRANSPORT=stdio -v /path/to/files:/data:ro mcp-convert-router:latest
 
 # 需要旧格式 doc/xls/ppt 转换（体积会变大）
 docker build --build-arg INSTALL_LIBREOFFICE=1 -t mcp-convert-router:latest .
@@ -69,13 +69,28 @@ docker build --build-arg INSTALL_LIBREOFFICE=1 -t mcp-convert-router:latest .
 如果你希望服务通过 HTTP 方式对外提供（便于容器化部署/探活/端口暴露），可以用 SSE 传输：
 
 ```bash
+docker run --rm -p 8000:8000 mcp-convert-router:latest
+```
+
+也可以显式指定参数：
+
+```bash
 docker run --rm -p 8000:8000 mcp-convert-router:latest --transport sse --host 0.0.0.0 --port 8000
 ```
 
-也可以用环境变量提供默认值（代码会读取 `MCP_TRANSPORT/MCP_HOST/MCP_PORT` 等；本镜像默认 `CMD` 是 stdio，所以仍需显式传 `--transport sse` 覆盖）：
+如果你在 Nginx/网关后面以子路径暴露（例如对外是 `/mcp`），需要配置 `--root-path`（保证 SSE 返回给客户端的消息投递地址包含前缀）：
 
 ```bash
-docker run --rm -p 8000:8000 -e MCP_HOST=0.0.0.0 -e MCP_PORT=8000 mcp-convert-router:latest --transport sse
+docker run --rm -p 8000:8000 mcp-convert-router:latest --transport sse --root-path /mcp
+```
+
+### 6. 启动参数自检（双重验证）
+
+你可以用 `--dry-run` 在不真正启动服务的情况下，确认“代码解析到的最终配置”和“容器入口参数”：
+
+```bash
+python -m mcp_convert_router.server --dry-run
+docker run --rm mcp-convert-router:latest --dry-run
 ```
 
 ## 使用示例
