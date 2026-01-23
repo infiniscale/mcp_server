@@ -12,19 +12,26 @@ WORKDIR ${APP_HOME}
 
 # Optional features:
 # - INSTALL_LIBREOFFICE=1 enables legacy Office conversion via soffice (large image)
-# - INSTALL_CROC=1 enables croc receive mode (package availability varies by distro)
+# - INSTALL_CROC=1 enables croc receive mode (downloaded from GitHub releases)
 ARG INSTALL_LIBREOFFICE=0
-ARG INSTALL_CROC=0
+ARG INSTALL_CROC=1
+ARG CROC_VERSION=10.3.1
 
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates pandoc; \
+    apt-get install -y --no-install-recommends ca-certificates pandoc curl; \
     if [ "${INSTALL_LIBREOFFICE}" = "1" ] || [ "${INSTALL_LIBREOFFICE}" = "true" ]; then \
       apt-get install -y --no-install-recommends libreoffice; \
     fi; \
     if [ "${INSTALL_CROC}" = "1" ] || [ "${INSTALL_CROC}" = "true" ]; then \
-      apt-get install -y --no-install-recommends croc; \
+      curl -fL "https://github.com/schollz/croc/releases/download/v${CROC_VERSION}/croc_v${CROC_VERSION}_Linux-64bit.tar.gz" \
+        -o /tmp/croc.tar.gz; \
+      tar -xzf /tmp/croc.tar.gz -C /tmp; \
+      mv /tmp/croc /usr/local/bin/croc; \
+      chmod +x /usr/local/bin/croc; \
+      rm -rf /tmp/*; \
     fi; \
+    apt-get purge -y --auto-remove curl; \
     rm -rf /var/lib/apt/lists/*
 
 RUN set -eux; \
