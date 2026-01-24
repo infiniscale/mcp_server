@@ -109,6 +109,14 @@ type CrocSendResponse struct {
 	FileName string `json:"file_name"`
 	FileSize int64  `json:"file_size"`
 	PID      int    `json:"pid"`
+	NextAction *NextAction `json:"next_action,omitempty"`
+}
+
+// NextAction describes a machine-executable "what to call next" hint for orchestration layers.
+type NextAction struct {
+	Tool      string         `json:"tool"`
+	MCP       string         `json:"mcp,omitempty"`
+	Arguments map[string]any `json:"arguments"`
 }
 
 // generateRandomCode generates a random short alphanumeric code.
@@ -243,6 +251,13 @@ func (fs *FilesystemHandler) HandleCrocSend(ctx context.Context, request mcp.Cal
 		FileName: fileName,
 		FileSize: fileSize,
 		PID:      pid,
+		NextAction: &NextAction{
+			Tool: "convert_to_markdown",
+			MCP:  "convert-router（服务端）",
+			Arguments: map[string]any{
+				"croc_code": code,
+			},
+		},
 	}
 
 	jsonBytes, err := json.Marshal(response)

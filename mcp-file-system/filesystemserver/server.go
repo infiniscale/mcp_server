@@ -211,6 +211,7 @@ func NewFilesystemServer(allowedDirs []string) (*server.MCPServer, error) {
 
 ## 返回值
 返回随机 croc code（例如 'k3m9u2x1q8'），此 code 需传递给服务端 convert_to_markdown 工具（推荐使用 croc_code 参数，或直接用 source 传入）。
+同时返回 next_action（机器可执行），便于编排层自动继续调用 convert_to_markdown。
 
 ## 典型工作流
 1. 客户端调用 croc_send(path='/local/file.pdf') → 获取 code
