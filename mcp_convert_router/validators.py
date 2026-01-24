@@ -18,8 +18,10 @@ ALLOWED_EXTENSIONS = {
 # 默认最大文件大小 (MB)
 DEFAULT_MAX_FILE_MB = 50
 
-# croc code 格式正则（数字-单词-单词-单词 或类似格式）
+# croc code 格式正则（常见格式：数字-单词-单词-单词）
 CROC_CODE_PATTERN = re.compile(r"^\d+-[a-zA-Z]+-[a-zA-Z]+-[a-zA-Z]+$")
+# 本项目的 croc_send 默认生成短码（字母数字），用于程序化传递
+SHORT_CROC_CODE_PATTERN = re.compile(r"^[a-zA-Z0-9]{6,32}$")
 
 # URL 协议正则
 URL_PATTERN = re.compile(r"^https?://", re.IGNORECASE)
@@ -45,7 +47,8 @@ def detect_source_type(source: str) -> str:
 
     检测规则（按优先级）：
     1. 以 http:// 或 https:// 开头 → url
-    2. 匹配 croc code 格式（数字-单词-单词-单词）→ croc_code
+    2. 匹配常见 croc code 格式（数字-单词-单词-单词）→ croc_code
+    3. 匹配短 croc code（6~32 位字母数字，且包含至少一个数字）→ croc_code
     3. 其他情况 → file_path
     """
     source = source.strip()
@@ -56,6 +59,10 @@ def detect_source_type(source: str) -> str:
 
     # 2. Croc Code 检测（数字-单词-单词-单词 格式）
     if CROC_CODE_PATTERN.match(source):
+        return "croc_code"
+
+    # 2.5 短 croc code（避免把常见英文单词误判成 code：要求至少包含一个数字）
+    if SHORT_CROC_CODE_PATTERN.match(source) and any(ch.isdigit() for ch in source):
         return "croc_code"
 
     # 3. 默认为文件路径

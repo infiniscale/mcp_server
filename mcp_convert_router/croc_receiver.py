@@ -59,31 +59,39 @@ async def receive_file_via_croc(
     input_dir.mkdir(parents=True, exist_ok=True)
 
     # 构建 croc 命令（使用参数数组，避免 shell 注入）
+    #
+    # croc v10+ 默认“新模式”：不再支持把 code 作为位置参数（会直接输出提示并 exit 0）。
+    # 新模式下应通过环境变量 CROC_SECRET 传入 code，并直接运行 `croc`（不带 code 参数）。
     cmd = [
         "croc",
         "--yes",  # 自动确认接收
         "--out", str(input_dir),  # 输出目录
-        croc_code  # croc code
     ]
 
     try:
         # 执行 croc（shell=False 防止注入）
+        env = os.environ.copy()
+        env["CROC_SECRET"] = croc_code
+
         proc_result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
             shell=False,
-            cwd=str(input_dir)  # 在输入目录中执行
+            cwd=str(input_dir),  # 在输入目录中执行
+            env=env,
         )
 
         result["exit_code"] = proc_result.returncode
         result["elapsed_ms"] = int((time.time() - start_time) * 1000)
+        stdout_tail = proc_result.stdout[-500:] if proc_result.stdout else None
+        stderr_tail = proc_result.stderr[-500:] if proc_result.stderr else None
 
         if proc_result.returncode != 0:
             result["error_code"] = "E_CROC_FAILED"
             result["error_message"] = proc_result.stderr or f"croc 返回错误码 {proc_result.returncode}"
-            result["stderr_tail"] = proc_result.stderr[-500:] if proc_result.stderr else None
+            result["stderr_tail"] = stderr_tail or stdout_tail
             return result
 
         # 检查接收结果：查找接收到的文件
@@ -92,6 +100,7 @@ async def receive_file_via_croc(
         if not received_files:
             result["error_code"] = "E_CROC_NO_FILE"
             result["error_message"] = "croc 执行成功但未接收到任何文件"
+            result["stderr_tail"] = stderr_tail or stdout_tail
             return result
 
         # 只支持单文件，多文件时选择最大的

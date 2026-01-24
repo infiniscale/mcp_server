@@ -24,6 +24,8 @@ pandoc --version
 # 可选：安装 croc（用于跨机器文件传输）
 brew install croc    # macOS
 apt install croc     # Ubuntu
+
+# 注意：croc v10+ 推荐通过环境变量 `CROC_SECRET` 传入 code；本服务在接收阶段会自动设置该变量
 ```
 
 ### 2. 配置 MinerU（可选）

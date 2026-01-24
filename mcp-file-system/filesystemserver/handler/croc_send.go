@@ -111,13 +111,24 @@ type CrocSendResponse struct {
 	PID      int    `json:"pid"`
 }
 
-// generateRandomCode generates a random 6-character alphanumeric code
+// generateRandomCode generates a random short alphanumeric code.
+// Keep it long enough to avoid collisions across concurrent/multi-user usage.
 func generateRandomCode() string {
 	const charset = "abcdefghijklmnopqrstuvwxyz0123456789"
-	code := make([]byte, 6)
+	const length = 10
+	code := make([]byte, length)
+	hasDigit := false
 	for i := range code {
 		n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
 		code[i] = charset[n.Int64()]
+		if code[i] >= '0' && code[i] <= '9' {
+			hasDigit = true
+		}
+	}
+	// Ensure at least one digit so short codes can be reliably auto-detected.
+	if !hasDigit {
+		n, _ := rand.Int(rand.Reader, big.NewInt(10))
+		code[0] = byte('0' + n.Int64())
 	}
 	return string(code)
 }
@@ -143,17 +154,19 @@ func (fs *FilesystemHandler) HandleCrocSend(ctx context.Context, request mcp.Cal
 	fileName := fileInfo.Name()
 	fileSize := fileInfo.Size()
 
-	// Generate random 6-character code
+	// Generate random code
 	code := generateRandomCode()
 
 	// Create context with cancel for process management
 	procCtx, cancel := context.WithCancel(context.Background())
 
 	// Build croc send command with generated code
-	args := []string{"send", "--code", code, validPath}
+	// croc v10+ defaults to the new mode; provide code via CROC_SECRET (not via --code).
+	args := []string{"--yes", "send", validPath}
 
 	// Start croc send process
 	cmd := exec.CommandContext(procCtx, "croc", args...)
+	cmd.Env = append(os.Environ(), fmt.Sprintf("CROC_SECRET=%s", code))
 
 	// Get stdout and stderr pipes for monitoring
 	stdout, err := cmd.StdoutPipe()

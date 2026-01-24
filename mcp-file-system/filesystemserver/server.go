@@ -210,11 +210,11 @@ func NewFilesystemServer(allowedDirs []string) (*server.MCPServer, error) {
 将客户端本地文件传输到配置了 MinerU 转换服务的远端服务器进行处理。
 
 ## 返回值
-返回 croc code（如 '78ayx1'），此 code 需传递给服务端 convert_to_markdown 工具的 source 参数。
+返回随机 croc code（例如 'k3m9u2x1q8'），此 code 需传递给服务端 convert_to_markdown 工具（推荐使用 croc_code 参数，或直接用 source 传入）。
 
 ## 典型工作流
 1. 客户端调用 croc_send(path='/local/file.pdf') → 获取 code
-2. 将 code 传给服务端 convert_to_markdown(source='78ayx1') → 服务端接收并转换
+2. 将 code 传给服务端 convert_to_markdown(croc_code='k3m9u2x1q8') → 服务端接收并转换
 
 ## 注意
 - 进程在后台运行，等待接收方连接

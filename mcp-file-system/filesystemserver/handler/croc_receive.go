@@ -59,8 +59,10 @@ func (fs *FilesystemHandler) HandleCrocReceive(ctx context.Context, request mcp.
 	// Create context with cancel for process management
 	procCtx, cancel := context.WithCancel(context.Background())
 
-	// Start croc receive process with --yes to auto-accept and --out for output directory
-	cmd := exec.CommandContext(procCtx, "croc", "--yes", "--out", validDir, code)
+	// Start croc receive process with --yes to auto-accept and --out for output directory.
+	// croc v10+ defaults to the new mode; code must be provided via CROC_SECRET (not as a positional arg).
+	cmd := exec.CommandContext(procCtx, "croc", "--yes", "--out", validDir)
+	cmd.Env = append(os.Environ(), fmt.Sprintf("CROC_SECRET=%s", code))
 
 	// Set working directory to output directory
 	cmd.Dir = validDir
