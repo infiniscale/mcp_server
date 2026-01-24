@@ -204,7 +204,22 @@ func NewFilesystemServer(allowedDirs []string) (*server.MCPServer, error) {
 	// Croc file transfer tools
 	s.AddTool(mcp.NewTool(
 		"croc_send",
-		mcp.WithDescription("Send a file or folder to another machine using croc. Automatically generates a 6-character code and returns immediately. The croc process runs in the background waiting for a recipient."),
+		mcp.WithDescription(`【客户端·文件传输工具】将本地文件发送到远端服务器。
+
+## 核心用途
+将客户端本地文件传输到配置了 MinerU 转换服务的远端服务器进行处理。
+
+## 返回值
+返回 croc code（如 '78ayx1'），此 code 需传递给服务端 convert_to_markdown 工具的 source 参数。
+
+## 典型工作流
+1. 客户端调用 croc_send(path='/local/file.pdf') → 获取 code
+2. 将 code 传给服务端 convert_to_markdown(source='78ayx1') → 服务端接收并转换
+
+## 注意
+- 进程在后台运行，等待接收方连接
+- 使用 croc_status 查看传输状态
+- 使用 croc_cancel 取消传输`),
 		mcp.WithString("path",
 			mcp.Description("Path to the file or folder to send"),
 			mcp.Required(),

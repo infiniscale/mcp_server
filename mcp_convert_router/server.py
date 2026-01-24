@@ -38,23 +38,23 @@ async def handle_list_tools() -> list[types.Tool]:
         types.Tool(
             name="convert_to_markdown",
             description=(
-                "将文件转换为 Markdown 格式。\n\n"
-                "## 快速使用（推荐）\n"
+                "【服务端·转换服务工具】将文件转换为 Markdown 格式。\n\n"
+                "## 智能判断流程（推荐）\n"
+                "1. 先调用 health 工具检查服务端引擎状态\n"
+                "2. 若有 URL → 直接 source=url\n"
+                "3. 若文件在客户端本地 → 先用客户端的 croc_send 发送，再用返回的 code 调用本工具\n"
+                "4. 若引擎不可用 → 本工具会返回 next_action 建议\n\n"
+                "## 快速使用\n"
                 "只需填写 source 参数，系统自动识别类型：\n"
-                "- 本地文件: source='/data/report.pdf'\n"
+                "- 服务端本地文件: source='/data/report.pdf'\n"
                 "- 网络文件: source='https://example.com/doc.pdf'\n"
-                "- 跨机器传输: source='7928-alpha-bravo-charlie'（Croc Code）\n\n"
-                "## Croc 跨机器传输流程（重要！）\n"
-                "如果文件在远程机器上，需要两步操作：\n"
-                "1. 【远程机器】先调用 croc_send 工具发送文件 → 获取返回的 code\n"
-                "2. 【本工具】将获取的 code 作为 source 参数传入\n"
-                "示例: source='7928-alpha-bravo-charlie'\n\n"
+                "- 跨机器传输: source='78ayx1'（Croc Code，需先在客户端调用 croc_send 获取）\n\n"
+                "## 跨机器传输流程\n"
+                "当文件在客户端本地时：\n"
+                "1. 客户端调用 croc_send(path='/local/file.pdf') → 获取 code\n"
+                "2. 本工具调用 convert_to_markdown(source=code) → 服务端接收并转换\n\n"
                 "## 支持的格式\n"
-                "pdf, docx, pptx, xlsx, csv, txt, md, html, png, jpg 等\n\n"
-                "## 默认行为\n"
-                "- 引擎自动选择（无需指定 route）\n"
-                "- 仅返回文本内容\n"
-                "- 大多数情况只需填写 source 即可"
+                "pdf, docx, pptx, xlsx, csv, txt, md, html, png, jpg 等"
             ),
             inputSchema={
                 "type": "object",
@@ -139,7 +139,18 @@ async def handle_list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="health",
-            description="检查服务健康状态，包括各引擎是否可用",
+            description=(
+                "【服务端·状态检查工具】检查服务端引擎可用性。\n\n"
+                "## 推荐使用场景\n"
+                "在调用 convert_to_markdown 前先调用此工具，了解服务端能力：\n"
+                "- 若 MinerU 可用 → 可处理 PDF/图片/PPT\n"
+                "- 若 MinerU 不可用 → PDF 等文件需通过 croc 传输到其他服务器\n"
+                "- 若 Pandoc 可用 → 可处理 docx/html/txt 等\n\n"
+                "## 返回信息\n"
+                "- engines: 各引擎状态\n"
+                "- capabilities: 当前可处理的文件类型\n"
+                "- suggestions: 根据状态给出的操作建议"
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {},
@@ -147,6 +158,74 @@ async def handle_list_tools() -> list[types.Tool]:
             }
         )
     ]
+
+
+def _generate_next_action(error_code: str, engine: str, source_type: str) -> Optional[Dict[str, Any]]:
+    """根据错误类型生成下一步行动建议。
+
+    Args:
+        error_code: 错误码
+        engine: 当前使用的引擎
+        source_type: 输入来源类型 (file_path, url, croc_code)
+
+    Returns:
+        dict: 下一步行动建议，包含 tool, reason, instruction 等字段
+    """
+    # MinerU 未配置：建议使用 croc 传输到配置了 MinerU 的服务器
+    if error_code == "E_MINERU_NOT_CONFIGURED":
+        return {
+            "tool": "croc_send",
+            "mcp": "filesystem（客户端）",
+            "reason": "当前服务端 MinerU 未配置，无法处理 PDF/图片等文件",
+            "instruction": (
+                "请在客户端执行以下步骤：\n"
+                "1. 调用 croc_send(path='文件路径') 发送文件\n"
+                "2. 获取返回的 code\n"
+                "3. 使用 code 调用配置了 MinerU 的服务端 convert_to_markdown(source=code)"
+            ),
+            "alternative": "或者提供文件的公网 URL，使用 source=url 方式转换"
+        }
+
+    # MinerU 超时
+    if error_code == "E_TIMEOUT" and engine == "mineru":
+        return {
+            "tool": "convert_to_markdown",
+            "reason": "MinerU 处理超时，可能是文件过大或服务繁忙",
+            "instruction": (
+                "建议：\n"
+                "1. 使用 page_ranges 参数指定部分页面（如 '1-10'）\n"
+                "2. 稍后重试\n"
+                "3. 检查文件大小是否超过限制"
+            )
+        }
+
+    # MinerU API 错误
+    if error_code in ("E_MINERU_API_ERROR", "E_MINERU_FAILED"):
+        return {
+            "tool": "health",
+            "reason": "MinerU 服务返回错误",
+            "instruction": (
+                "请先调用 health 工具检查服务状态，确认：\n"
+                "1. MinerU API Key 是否有效\n"
+                "2. 服务是否可用\n"
+                "3. 文件格式是否支持"
+            )
+        }
+
+    # 文件不存在（本地路径模式）
+    if error_code == "E_FILE_NOT_FOUND" and source_type == "file_path":
+        return {
+            "tool": "croc_send",
+            "mcp": "filesystem（客户端）",
+            "reason": "服务端未找到指定文件，文件可能在客户端本地",
+            "instruction": (
+                "如果文件在客户端本地：\n"
+                "1. 调用客户端的 croc_send(path='本地文件路径')\n"
+                "2. 将返回的 code 传给 convert_to_markdown(source=code)"
+            )
+        }
+
+    return None
 
 
 @server.call_tool()
@@ -427,6 +506,13 @@ async def handle_convert_to_markdown(args: Dict[str, Any]) -> list[types.TextCon
             ctx.log_conversion_complete(engine, success=False)
             ctx.log_error(result["error_code"], result["error_message"])
 
+            # 智能返回：根据错误类型提供下一步行动建议
+            result["next_action"] = _generate_next_action(
+                error_code=result["error_code"],
+                engine=engine,
+                source_type=source_type
+            )
+
         # 添加警告
         if convert_result.get("warnings"):
             result["warnings"].extend(convert_result["warnings"])
@@ -572,6 +658,61 @@ async def handle_health() -> list[types.TextContent]:
     # 总体状态
     if not any(e.get("available") for e in health["engines"].values()):
         health["status"] = "degraded"
+
+    # 能力摘要：当前可处理的文件类型
+    capabilities = {
+        "can_process": [],
+        "cannot_process": []
+    }
+
+    if health["engines"].get("pandoc", {}).get("available"):
+        capabilities["can_process"].extend(["docx", "html", "txt", "md", "rst", "epub", "odt"])
+    else:
+        capabilities["cannot_process"].extend(["docx（需 Pandoc）", "html", "txt"])
+
+    if health["engines"].get("mineru", {}).get("available"):
+        capabilities["can_process"].extend(["pdf", "png", "jpg", "pptx", "ppt"])
+    else:
+        capabilities["cannot_process"].extend(["pdf", "png", "jpg", "pptx（需 MinerU）"])
+
+    if health["engines"].get("excel", {}).get("available"):
+        capabilities["can_process"].extend(["xlsx", "csv", "xls"])
+    else:
+        capabilities["cannot_process"].extend(["xlsx", "csv（需 openpyxl）"])
+
+    health["capabilities"] = capabilities
+
+    # 操作建议
+    suggestions = []
+
+    if not health["engines"].get("mineru", {}).get("available"):
+        suggestions.append({
+            "issue": "MinerU 不可用",
+            "impact": "无法处理 PDF、图片、PPT 等文件",
+            "solution": (
+                "方案1: 配置 MINERU_API_KEY 环境变量\n"
+                "方案2: 使用客户端 croc_send 将文件传输到配置了 MinerU 的服务器"
+            )
+        })
+
+    if not health["engines"].get("pandoc", {}).get("available"):
+        suggestions.append({
+            "issue": "Pandoc 不可用",
+            "impact": "无法处理 docx、html、txt 等文本格式",
+            "solution": "安装 Pandoc: brew install pandoc (macOS) 或 apt install pandoc (Ubuntu)"
+        })
+
+    if not health.get("croc", {}).get("available"):
+        suggestions.append({
+            "issue": "Croc 不可用",
+            "impact": "无法接收跨机器传输的文件",
+            "solution": "安装 croc: brew install croc (macOS) 或 apt install croc (Ubuntu)"
+        })
+
+    if suggestions:
+        health["suggestions"] = suggestions
+    else:
+        health["suggestions"] = [{"message": "所有引擎正常，可处理所有支持的文件格式"}]
 
     return [types.TextContent(
         type="text",
