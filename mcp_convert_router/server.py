@@ -38,80 +38,91 @@ async def handle_list_tools() -> list[types.Tool]:
         types.Tool(
             name="convert_to_markdown",
             description=(
-                "将文件转换为 Markdown 格式。支持多种输入方式和文件格式。\n\n"
-                "支持的输入方式：\n"
-                "- file_path: 服务端本地文件路径\n"
-                "- url: 远端文件 URL（http/https）\n"
-                "- croc_code: 跨机器传文件的 croc code\n\n"
-                "支持的文件格式：\n"
-                "- 文档: pdf, docx, doc, pptx, ppt, xlsx, xls, csv\n"
-                "- 文本: txt, md, html, rst, latex, epub, odt\n"
-                "- 图片: png, jpg, jpeg（需要 OCR）\n\n"
-                "路由引擎：\n"
-                "- pandoc: 适合 docx/html/txt/markdown 等结构化文本\n"
-                "- mineru: 适合 pdf/图片/pptx（支持 OCR）\n"
-                "- excel: 适合 xlsx/csv 表格"
+                "将文件转换为 Markdown 格式。\n\n"
+                "## 快速使用（推荐）\n"
+                "只需填写 source 参数，系统自动识别类型：\n"
+                "- 本地文件: source='/data/report.pdf'\n"
+                "- 网络文件: source='https://example.com/doc.pdf'\n"
+                "- 跨机器传输: source='7928-alpha-bravo-charlie'（Croc Code）\n\n"
+                "## Croc 跨机器传输流程（重要！）\n"
+                "如果文件在远程机器上，需要两步操作：\n"
+                "1. 【远程机器】先调用 croc_send 工具发送文件 → 获取返回的 code\n"
+                "2. 【本工具】将获取的 code 作为 source 参数传入\n"
+                "示例: source='7928-alpha-bravo-charlie'\n\n"
+                "## 支持的格式\n"
+                "pdf, docx, pptx, xlsx, csv, txt, md, html, png, jpg 等\n\n"
+                "## 默认行为\n"
+                "- 引擎自动选择（无需指定 route）\n"
+                "- 仅返回文本内容\n"
+                "- 大多数情况只需填写 source 即可"
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    # === 输入来源（三选一）===
+                    # === 推荐用法：统一输入 ===
+                    "source": {
+                        "type": "string",
+                        "description": (
+                            "【推荐】文件来源，自动识别类型。支持三种格式：\n"
+                            "- 本地路径: /path/to/file.pdf\n"
+                            "- URL: https://example.com/file.pdf\n"
+                            "- Croc Code: 7928-alpha-bravo（需先在远程机器调用 croc_send 获取）"
+                        )
+                    },
+                    # === 兼容旧参数（仍可使用）===
                     "file_path": {
                         "type": "string",
-                        "description": "服务端本地文件路径。例如: /path/to/document.pdf"
+                        "description": "服务端本地文件路径（可用 source 代替）"
                     },
                     "url": {
                         "type": "string",
-                        "description": "远端文件 URL（仅支持 http/https）。例如: https://example.com/document.pdf"
+                        "description": "远端文件 URL（可用 source 代替）"
                     },
                     "croc_code": {
                         "type": "string",
-                        "description": "croc 传输码，用于跨机器接收文件。格式: 数字-单词-单词-单词"
+                        "description": "Croc 传输码（可用 source 代替）。需先在远程机器调用 croc_send 获取"
                     },
-                    # === 路由控制 ===
+                    # === 常用参数 ===
+                    "enable_ocr": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "启用 OCR（扫描件/图片需要）"
+                    },
+                    # === 高级参数（通常无需设置）===
                     "route": {
                         "type": "string",
                         "enum": ["auto", "pandoc", "mineru", "excel"],
                         "default": "auto",
-                        "description": "选择转换引擎。auto 会根据文件类型自动选择最佳引擎"
-                    },
-                    # === OCR 相关（仅 MinerU 生效）===
-                    "enable_ocr": {
-                        "type": "boolean",
-                        "default": False,
-                        "description": "是否启用 OCR 识别（仅对 MinerU 引擎生效，适用于扫描件/图片）"
+                        "description": "转换引擎（auto=自动选择）"
                     },
                     "language": {
                         "type": "string",
                         "default": "ch",
-                        "description": "OCR 语言。ch=中文, en=英文"
+                        "description": "OCR 语言（ch=中文, en=英文）"
                     },
-                    # === 页面范围（仅 MinerU 远程 API）===
                     "page_ranges": {
                         "type": "string",
-                        "description": "指定页码范围（仅 MinerU 远程 API）。例如: '2,4-6' 或 '2--2'（到倒数第2页）"
+                        "description": "页码范围（仅 MinerU）。例如: '2,4-6'"
                     },
-                    # === 输出控制 ===
                     "output_dir": {
                         "type": "string",
-                        "description": "自定义输出目录（可选，不传则使用服务端临时目录）"
+                        "description": "自定义输出目录"
                     },
                     "return_mode": {
                         "type": "string",
                         "enum": ["text", "path", "both"],
                         "default": "text",
-                        "description": "返回模式。text=仅返回文本, path=仅返回路径, both=两者都返回"
+                        "description": "返回模式"
                     },
-                    # === 安全限制 ===
                     "max_file_mb": {
                         "type": "number",
                         "default": 50,
-                        "description": "最大文件大小（MB），默认 50MB"
+                        "description": "最大文件大小（MB）"
                     },
                     "croc_timeout_seconds": {
                         "type": "number",
                         "default": 300,
-                        "description": "croc 接收超时时间（秒），默认 300 秒"
+                        "description": "Croc 接收超时（秒）"
                     }
                 },
                 "additionalProperties": False

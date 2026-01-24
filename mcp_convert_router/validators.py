@@ -21,6 +21,9 @@ DEFAULT_MAX_FILE_MB = 50
 # croc code 格式正则（数字-单词-单词-单词 或类似格式）
 CROC_CODE_PATTERN = re.compile(r"^\d+-[a-zA-Z]+-[a-zA-Z]+-[a-zA-Z]+$")
 
+# URL 协议正则
+URL_PATTERN = re.compile(r"^https?://", re.IGNORECASE)
+
 
 class ValidationError(Exception):
     """验证错误。"""
@@ -30,9 +33,42 @@ class ValidationError(Exception):
         super().__init__(message)
 
 
+def detect_source_type(source: str) -> str:
+    """
+    自动检测 source 参数的类型。
+
+    Args:
+        source: 输入的 source 值
+
+    Returns:
+        str: "url" | "croc_code" | "file_path"
+
+    检测规则（按优先级）：
+    1. 以 http:// 或 https:// 开头 → url
+    2. 匹配 croc code 格式（数字-单词-单词-单词）→ croc_code
+    3. 其他情况 → file_path
+    """
+    source = source.strip()
+
+    # 1. URL 检测
+    if URL_PATTERN.match(source):
+        return "url"
+
+    # 2. Croc Code 检测（数字-单词-单词-单词 格式）
+    if CROC_CODE_PATTERN.match(source):
+        return "croc_code"
+
+    # 3. 默认为文件路径
+    return "file_path"
+
+
 def validate_input(args: Dict[str, Any]) -> Dict[str, Any]:
     """
     验证输入参数。
+
+    支持两种用法：
+    1. 推荐用法：使用 source 参数，自动检测类型
+    2. 兼容用法：使用 file_path / url / croc_code 参数
 
     Args:
         args: 工具调用参数
@@ -46,18 +82,34 @@ def validate_input(args: Dict[str, Any]) -> Dict[str, Any]:
             "error_message": str (如果无效)
         }
     """
+    # 获取所有可能的输入来源
+    source = args.get("source")
     file_path = args.get("file_path")
     url = args.get("url")
     croc_code = args.get("croc_code")
 
-    # 检查输入来源（三选一）
+    # 优先使用 source 参数（推荐用法）
+    if source:
+        # 如果同时指定了其他参数，给出警告但仍使用 source
+        source_type = detect_source_type(source)
+        source_value = source.strip()
+
+        # 根据检测到的类型进行验证
+        if source_type == "file_path":
+            return validate_file_path(source_value, args)
+        elif source_type == "url":
+            return validate_url(source_value, args)
+        elif source_type == "croc_code":
+            return validate_croc_code(source_value, args)
+
+    # 兼容旧用法：使用 file_path / url / croc_code 参数
     sources = [(k, v) for k, v in [("file_path", file_path), ("url", url), ("croc_code", croc_code)] if v]
 
     if len(sources) == 0:
         return {
             "valid": False,
             "error_code": "E_INPUT_MISSING",
-            "error_message": "必须提供 file_path、url 或 croc_code 其中之一"
+            "error_message": "必须提供 source 参数，或 file_path/url/croc_code 其中之一"
         }
 
     if len(sources) > 1:
