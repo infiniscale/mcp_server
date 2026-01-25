@@ -319,6 +319,13 @@ async def _convert_remote(
 
         resp = await client.post(f"{api_base}/api/v4/file-urls/batch", json=payload, headers=headers)
         resp.raise_for_status()
+        _maybe_log(
+            "mineru_http_response",
+            "MinerU 远程响应体",
+            status=resp.status_code,
+            endpoint="/api/v4/file-urls/batch",
+            body=resp.text,
+        )
         data = resp.json().get("data") or {}
         batch_id = data.get("batch_id")
         file_urls = data.get("file_urls") or []
@@ -360,6 +367,13 @@ async def _convert_remote(
         while time.time() < deadline:
             status_resp = await client.get(f"{api_base}/api/v4/extract-results/batch/{batch_id}", headers=headers)
             status_resp.raise_for_status()
+            _maybe_log(
+                "mineru_http_response",
+                "MinerU 远程响应体",
+                status=status_resp.status_code,
+                endpoint="/api/v4/extract-results/batch/{batch_id}",
+                body=status_resp.text,
+            )
             status_data = status_resp.json().get("data") or {}
             extract_result = status_data.get("extract_result") or []
 
@@ -475,6 +489,12 @@ async def _convert_local(
 
         resp = await client.post(f"{api_base}/file_parse", files=files, data=data)
         resp.raise_for_status()
+        _maybe_log(
+            "mineru_http_response",
+            "MinerU 本地响应体",
+            status=resp.status_code,
+            body=resp.text,
+        )
 
         # 尝试解析 JSON
         try:
