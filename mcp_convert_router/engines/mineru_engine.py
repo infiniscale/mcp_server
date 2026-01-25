@@ -507,8 +507,18 @@ async def _convert_local(
             }
 
         # 常见字段：content/markdown/result_path/extract_dir/extract_path
+        # 或 results.<filename>.md_content (MinerU 2.7.1+ 本地 API 格式)
         markdown_text = payload.get("content") or payload.get("markdown") or ""
         extract_path = payload.get("extract_path") or payload.get("extract_dir") or payload.get("result_path") or ""
+
+        # 尝试从 results.<filename>.md_content 提取（MinerU 2.7.1+ 本地 API）
+        if not markdown_text and "results" in payload and isinstance(payload["results"], dict):
+            for file_key, file_result in payload["results"].items():
+                if isinstance(file_result, dict):
+                    md_content = file_result.get("md_content") or file_result.get("markdown") or file_result.get("content")
+                    if md_content:
+                        markdown_text = md_content
+                        break
 
         if extract_path:
             extract_dir = Path(extract_path)
