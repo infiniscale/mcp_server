@@ -36,7 +36,9 @@ RUN set -eux; \
 
 RUN set -eux; \
     addgroup --system app; \
-    adduser --system --ingroup app app
+    adduser --system --ingroup app --home /home/app app; \
+    mkdir -p /home/app; \
+    chown -R app:app /home/app
 
 COPY requirements.txt ${APP_HOME}/requirements.txt
 RUN pip install -r ${APP_HOME}/requirements.txt
@@ -50,9 +52,11 @@ USER app
 EXPOSE 8000
 
 # Default to Streamable HTTP in containers (modern clients often POST to the base URL).
+# HOME is required for croc to write its config files.
 ENV MCP_TRANSPORT=streamable_http \
     MCP_HOST=0.0.0.0 \
     MCP_PORT=8000 \
-    MCP_HTTP_PATH=/
+    MCP_HTTP_PATH=/ \
+    HOME=/home/app
 
 ENTRYPOINT ["python", "-m", "mcp_convert_router.server"]
