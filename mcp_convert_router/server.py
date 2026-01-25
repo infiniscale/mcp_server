@@ -153,7 +153,18 @@ async def handle_list_tools() -> list[types.Tool]:
             ),
             inputSchema={
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "probe": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "是否对 MinerU 的 api_base 做一次网络连通性探测（best-effort，不上传文件）"
+                    },
+                    "probe_timeout_seconds": {
+                        "type": "number",
+                        "default": 5,
+                        "description": "探测超时（秒）"
+                    }
+                },
                 "additionalProperties": False
             }
         )
@@ -239,7 +250,7 @@ async def handle_call_tool(
     elif name == "get_supported_formats":
         return await handle_get_supported_formats()
     elif name == "health":
-        return await handle_health()
+        return await handle_health(arguments or {})
     else:
         raise ValueError(f"Unknown tool: {name}")
 
@@ -580,10 +591,13 @@ async def handle_get_supported_formats() -> list[types.TextContent]:
     )]
 
 
-async def handle_health() -> list[types.TextContent]:
+async def handle_health(args: Dict[str, Any]) -> list[types.TextContent]:
     """检查服务健康状态。"""
     import json
     import subprocess
+    from pathlib import Path
+
+    import httpx
 
     health = {
         "status": "ok",
@@ -612,24 +626,56 @@ async def handle_health() -> list[types.TextContent]:
     mineru_api_key = os.getenv("MINERU_API_KEY", "")
     use_local_api = os.getenv("USE_LOCAL_API", "").lower() in ["true", "1", "yes"]
     local_api_base = os.getenv("LOCAL_MINERU_API_BASE", "http://localhost:8080")
+    remote_api_base = os.getenv("MINERU_API_BASE", "https://mineru.net")
+
+    probe = bool(args.get("probe", False))
+    probe_timeout_seconds = float(args.get("probe_timeout_seconds", 5))
+    running_in_docker = Path("/.dockerenv").exists()
 
     if mineru_api_key:
         health["engines"]["mineru"] = {
             "available": True,
             "mode": "remote",
-            "api_key_set": True
+            "api_key_set": True,
+            "api_base": remote_api_base,
+            "running_in_docker": running_in_docker,
         }
     elif use_local_api:
         health["engines"]["mineru"] = {
             "available": True,
             "mode": "local",
-            "api_base": local_api_base
+            "api_base": local_api_base,
+            "running_in_docker": running_in_docker,
         }
     else:
         health["engines"]["mineru"] = {
             "available": False,
             "error": "未配置 API Key 或本地 API"
         }
+
+    # 可选：对 MinerU api_base 做一次网络连通性探测（不上传文件）
+    mineru_engine = health["engines"].get("mineru") or {}
+    if probe and mineru_engine.get("available") and mineru_engine.get("api_base"):
+        api_base = str(mineru_engine.get("api_base") or "").rstrip("/")
+        probe_result: Dict[str, Any] = {"ok": False, "api_base": api_base, "timeout_seconds": probe_timeout_seconds}
+        try:
+            timeout = httpx.Timeout(connect=probe_timeout_seconds, read=probe_timeout_seconds, write=probe_timeout_seconds, pool=probe_timeout_seconds)
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                resp = await client.get(api_base + "/")
+            probe_result.update({"ok": True, "status_code": resp.status_code})
+        except Exception as e:
+            probe_result.update({"ok": False, "error_type": e.__class__.__name__, "error": str(e)})
+
+        # 针对 Docker + localhost 的常见误配置给出提示
+        if not probe_result.get("ok"):
+            if mineru_engine.get("mode") == "local" and running_in_docker:
+                if api_base.startswith("http://localhost") or api_base.startswith("http://127.0.0.1"):
+                    probe_result["hint"] = (
+                        "检测到容器内 local api_base 指向 localhost；容器内 localhost 指向容器自身。"
+                        "若 MinerU 跑在宿主机，请设置 LOCAL_MINERU_API_BASE=http://host.docker.internal:8080，"
+                        "或使用同一 docker network / docker-compose。"
+                    )
+        mineru_engine["probe"] = probe_result
 
     # 检查 Excel 依赖
     try:

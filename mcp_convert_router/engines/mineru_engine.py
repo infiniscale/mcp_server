@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional
 
 import httpx
 
+from ..logging_utils import get_current_context
 from ..zip_security import safe_extract_zip
 
 # 超时与轮询
@@ -31,6 +32,70 @@ def _mineru_remote_base() -> str:
 
 def _mineru_local_base() -> str:
     return (os.getenv("LOCAL_MINERU_API_BASE") or "http://localhost:8080").rstrip("/")
+
+
+def _running_in_docker() -> bool:
+    try:
+        return Path("/.dockerenv").exists()
+    except Exception:
+        return False
+
+
+def _sanitize_url(raw: str) -> str:
+    try:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(raw)
+        if not parsed.scheme or not parsed.netloc:
+            return raw.split("?", 1)[0].split("#", 1)[0]
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    except Exception:
+        return raw.split("?", 1)[0].split("#", 1)[0]
+
+
+def _maybe_log(event_type: str, message: str, **kwargs) -> None:
+    ctx = get_current_context()
+    if ctx is None:
+        return
+    ctx.log_event(event_type, message, **kwargs)
+
+
+def _mineru_debug_enabled() -> bool:
+    return _bool_env("MINERU_DEBUG", False)
+
+
+def _connection_hint(*, mode: str, api_base: str) -> str:
+    if mode == "local" and _running_in_docker():
+        if api_base.startswith("http://localhost") or api_base.startswith("http://127.0.0.1"):
+            return (
+                "检测到在 Docker 容器内使用本地 MinerU 且 api_base 指向 localhost；"
+                "容器内 localhost 指向容器自身。若 MinerU 跑在宿主机，请将 "
+                "LOCAL_MINERU_API_BASE 设置为 http://host.docker.internal:8080 "
+                "（或将 MinerU 和本服务加入同一 docker network / docker-compose）。"
+            )
+    if mode == "remote":
+        return "请检查容器是否允许访问外网、DNS 解析、代理/防火墙策略，以及 MINERU_API_BASE 是否可达。"
+    return ""
+
+
+def _format_httpx_request_error(err: httpx.RequestError, *, mode: str, api_base: str) -> str:
+    request_url = ""
+    try:
+        if getattr(err, "request", None) is not None and getattr(err.request, "url", None) is not None:
+            request_url = _sanitize_url(str(err.request.url))
+    except Exception:
+        request_url = ""
+
+    parts = [f"MinerU 连接失败（mode={mode}, api_base={api_base}）"]
+    if request_url:
+        parts.append(f"request_url={request_url}")
+    parts.append(f"error_type={err.__class__.__name__}")
+    if str(err):
+        parts.append(f"error={str(err)}")
+    hint = _connection_hint(mode=mode, api_base=api_base)
+    if hint:
+        parts.append(f"hint={hint}")
+    return "; ".join(parts)
 
 
 async def convert_with_mineru(
@@ -71,12 +136,29 @@ async def convert_with_mineru(
 
     api_key = (os.getenv("MINERU_API_KEY") or "").strip()
     use_local = _bool_env("USE_LOCAL_API", False)
+    mode = "remote" if api_key else ("local" if use_local else "unconfigured")
+    api_base = _mineru_remote_base() if mode == "remote" else (_mineru_local_base() if mode == "local" else "")
+    attempt["mode"] = mode
+    attempt["api_base"] = api_base
+    attempt["api_key_set"] = bool(api_key)
+    attempt["use_local_api"] = bool(use_local)
 
     try:
+        _maybe_log(
+            "mineru_config",
+            "MinerU 配置",
+            mode=mode,
+            api_base=api_base,
+            api_key_set=bool(api_key),
+            use_local_api=bool(use_local),
+            timeout_s=MINERU_TIMEOUT,
+            poll_interval_s=MINERU_POLL_INTERVAL_SECONDS,
+            running_in_docker=_running_in_docker(),
+        )
         if api_key:
             result = await _convert_remote(
                 file_path=Path(file_path),
-                api_base=_mineru_remote_base(),
+                api_base=api_base,
                 api_key=api_key,
                 enable_ocr=enable_ocr,
                 language=language,
@@ -86,7 +168,7 @@ async def convert_with_mineru(
         elif use_local:
             result = await _convert_local(
                 file_path=Path(file_path),
-                api_base=_mineru_local_base(),
+                api_base=api_base,
                 enable_ocr=enable_ocr,
                 language=language,
                 page_ranges=page_ranges,
@@ -118,13 +200,76 @@ async def convert_with_mineru(
     except httpx.TimeoutException:
         attempt["status"] = "error"
         attempt["error_code"] = "E_TIMEOUT"
-        attempt["error_message"] = f"MinerU 请求超时（{MINERU_TIMEOUT}秒）"
+        attempt["error_message"] = f"MinerU 请求超时（mode={mode}, api_base={api_base}, timeout={MINERU_TIMEOUT}秒）"
         attempt["timed_out"] = True
         attempt["elapsed_ms"] = int((time.time() - start_time) * 1000)
         return {
             "ok": False,
             "attempt": attempt,
             "error_code": "E_TIMEOUT",
+            "error_message": attempt["error_message"],
+            "warnings": warnings,
+        }
+    except httpx.HTTPStatusError as e:
+        status_code = None
+        sanitized_url = ""
+        response_preview = ""
+        try:
+            status_code = e.response.status_code
+        except Exception:
+            status_code = None
+        try:
+            sanitized_url = _sanitize_url(str(e.request.url))
+        except Exception:
+            sanitized_url = ""
+        try:
+            response_preview = (e.response.text or "")[:300].replace("\n", " ").strip()
+        except Exception:
+            response_preview = ""
+
+        attempt["status"] = "error"
+        attempt["error_code"] = "E_MINERU_API_ERROR"
+        attempt["error_message"] = (
+            f"MinerU API 返回错误（mode={mode}, api_base={api_base}, status={status_code}, url={sanitized_url}）"
+        )
+        attempt["elapsed_ms"] = int((time.time() - start_time) * 1000)
+        _maybe_log(
+            "warning",
+            "MinerU API HTTP 错误",
+            mode=mode,
+            api_base=api_base,
+            status=status_code,
+            url=sanitized_url,
+            response_preview=response_preview,
+        )
+        return {
+            "ok": False,
+            "attempt": attempt,
+            "error_code": "E_MINERU_API_ERROR",
+            "error_message": attempt["error_message"] + (f" response={response_preview}" if response_preview else ""),
+            "warnings": warnings,
+        }
+    except httpx.RequestError as e:
+        attempt["status"] = "error"
+        attempt["error_code"] = "E_MINERU_FAILED"
+        attempt["error_message"] = _format_httpx_request_error(e, mode=mode, api_base=api_base)
+        attempt["elapsed_ms"] = int((time.time() - start_time) * 1000)
+        _maybe_log(
+            "error",
+            "MinerU 请求失败",
+            mode=mode,
+            api_base=api_base,
+            error_type=e.__class__.__name__,
+            error=str(e),
+        )
+        if _mineru_debug_enabled():
+            cause = getattr(e, "__cause__", None)
+            if cause is not None:
+                _maybe_log("warning", "MinerU 异常 cause", cause_type=cause.__class__.__name__, cause=str(cause))
+        return {
+            "ok": False,
+            "attempt": attempt,
+            "error_code": "E_MINERU_FAILED",
             "error_message": attempt["error_message"],
             "warnings": warnings,
         }
@@ -161,6 +306,13 @@ async def _convert_remote(
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         # 1) 获取上传 URL
+        if _mineru_debug_enabled():
+            _maybe_log(
+                "mineru_http",
+                "MinerU 获取上传 URL",
+                api_base=api_base,
+                endpoint="/api/v4/file-urls/batch",
+            )
         payload = {"language": language, "files": [{"name": file_path.name, "is_ocr": enable_ocr}]}
         if page_ranges is not None:
             payload["files"][0]["page_ranges"] = page_ranges
@@ -176,6 +328,12 @@ async def _convert_remote(
         upload_url = file_urls[0]
 
         # 2) PUT 上传（不要设置 Content-Type，让存储服务处理）
+        if _mineru_debug_enabled():
+            _maybe_log(
+                "mineru_http",
+                "MinerU 上传文件（PUT 到存储）",
+                upload_url=_sanitize_url(upload_url),
+            )
         async def _file_iter(p: Path):
             with open(p, "rb") as f:
                 while True:
@@ -197,6 +355,7 @@ async def _convert_remote(
         full_zip_url: Optional[str] = None
         last_state: Optional[str] = None
         last_err: Optional[str] = None
+        last_logged_state: Optional[str] = None
 
         while time.time() < deadline:
             status_resp = await client.get(f"{api_base}/api/v4/extract-results/batch/{batch_id}", headers=headers)
@@ -215,6 +374,9 @@ async def _convert_remote(
 
             if item:
                 last_state = item.get("state")
+                if _mineru_debug_enabled() and last_state and last_state != last_logged_state:
+                    _maybe_log("mineru_poll", "MinerU 任务状态", batch_id=batch_id, state=last_state)
+                    last_logged_state = last_state
                 if last_state == "done":
                     full_zip_url = item.get("full_zip_url") or item.get("zip_url")
                     break
@@ -230,6 +392,12 @@ async def _convert_remote(
             return {"ok": False, "error_code": "E_TIMEOUT", "error_message": f"MinerU 任务未在 {MINERU_TIMEOUT} 秒内完成"}
 
         # 4) 下载结果 zip（流式 + 上限）
+        if _mineru_debug_enabled():
+            _maybe_log(
+                "mineru_http",
+                "MinerU 下载结果 zip",
+                zip_url=_sanitize_url(full_zip_url),
+            )
         out_dir = work_dir / "output" / "mineru" / str(batch_id)
         out_dir.mkdir(parents=True, exist_ok=True)
         zip_path = out_dir / "result.zip"
@@ -296,6 +464,8 @@ async def _convert_local(
 
     timeout = httpx.Timeout(connect=10, read=MINERU_TIMEOUT, write=60, pool=60)
     async with httpx.AsyncClient(timeout=timeout) as client:
+        if _mineru_debug_enabled():
+            _maybe_log("mineru_http", "MinerU 本地调用 /file_parse", api_base=api_base, endpoint="/file_parse")
         files = {"files": (file_path.name, file_path.read_bytes(), "application/octet-stream")}
         data = {"parse_method": "auto", "language": language}
         if enable_ocr:
