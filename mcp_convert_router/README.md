@@ -159,14 +159,13 @@ python mcp_convert_router/verify_mcp_deploy.py --base-url http://127.0.0.1:8000
 }
 ```
 
-### 示例 4：指定转换引擎
+### 示例 4：启用 OCR 转换（扫描件/图片）
 
 ```json
 {
   "tool": "convert_to_markdown",
   "arguments": {
-    "file_path": "/path/to/document.docx",
-    "route": "mineru",
+    "file_path": "/path/to/scanned.pdf",
     "enable_ocr": true
   }
 }

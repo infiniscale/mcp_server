@@ -89,12 +89,6 @@ async def handle_list_tools() -> list[types.Tool]:
                         "description": "启用 OCR（扫描件/图片需要）"
                     },
                     # === 高级参数（通常无需设置）===
-                    "route": {
-                        "type": "string",
-                        "enum": ["auto", "pandoc", "mineru", "excel"],
-                        "default": "auto",
-                        "description": "转换引擎（auto=自动选择）"
-                    },
                     "language": {
                         "type": "string",
                         "default": "ch",
@@ -460,11 +454,10 @@ async def handle_convert_to_markdown(args: Dict[str, Any]) -> list[types.TextCon
                     )
                     ctx.log_warning(f"旧格式转换失败: {error_code}")
 
-        # 4. 选择引擎
-        route = args.get("route", "auto")
-        engine = choose_engine(detected_type, file_path.suffix.lower(), route)
+        # 4. 自动选择引擎
+        engine = choose_engine(detected_type, file_path.suffix.lower())
         result["engine_used"] = engine
-        ctx.log_engine_selected(engine, route)
+        ctx.log_engine_selected(engine, "auto")
 
         # 5. 执行转换
         enable_ocr = args.get("enable_ocr", False)
