@@ -46,6 +46,7 @@ async def download_file_from_url(
     max_bytes: int = DEFAULT_MAX_DOWNLOAD_BYTES,
     connect_timeout: int = DEFAULT_CONNECT_TIMEOUT,
     read_timeout: int = DEFAULT_READ_TIMEOUT,
+    custom_headers: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """
     从 URL 下载文件并保存到工作目录。
@@ -61,6 +62,7 @@ async def download_file_from_url(
         max_bytes: 最大下载大小（字节）
         connect_timeout: 连接超时（秒）
         read_timeout: 读取超时（秒）
+        custom_headers: 可选的自定义 HTTP 请求头（如 Authorization）
 
     Returns:
         Dict[str, Any]: {
@@ -118,10 +120,14 @@ async def download_file_from_url(
 
     # 5. 下载文件
     try:
+        # 准备请求头
+        headers = custom_headers.copy() if custom_headers else {}
+
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(connect=connect_timeout, read=read_timeout, write=30, pool=30),
             follow_redirects=False,  # 手动处理重定向以检查每个目标
-            max_redirects=0
+            max_redirects=0,
+            headers=headers
         ) as client:
 
             current_url = url
@@ -220,17 +226,16 @@ async def download_file_from_url(
 
 
 async def _check_ssrf(hostname: str) -> Dict[str, Any]:
-    """
-    SSRF 防护：检查主机名是否安全。
-
-    Args:
-        hostname: 主机名
-
-    Returns:
-        Dict[str, Any]: {"safe": bool, "reason": str, "ip": str}
-    """
+    """SSRF 防护：检查主机名是否安全。允许白名单中的主机绕过检查。"""
     if not hostname:
         return {"safe": False, "reason": "主机名为空", "ip": None}
+
+    # 检查白名单
+    import os
+    allowed_hosts = {h.strip().lower() for h in os.getenv("MCP_CONVERT_ALLOWED_URL_HOSTS", "").split(",") if h.strip()}
+
+    if hostname.lower() in allowed_hosts:
+        return {"safe": True, "reason": "allowlisted", "ip": None, "allowlisted": True}
 
     # 检查常见危险主机名
     dangerous_hostnames = [
@@ -249,6 +254,10 @@ async def _check_ssrf(hostname: str) -> Dict[str, Any]:
     # 检查是否是 IP 地址
     try:
         ip = ipaddress.ip_address(hostname.strip("[]"))
+
+        if str(ip) in allowed_hosts:
+            return {"safe": True, "reason": "allowlisted", "ip": str(ip), "allowlisted": True}
+
         if _is_private_ip(ip):
             return {"safe": False, "reason": f"不允许访问私有/保留 IP: {ip}", "ip": str(ip)}
         return {"safe": True, "reason": None, "ip": str(ip)}

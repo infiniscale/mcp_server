@@ -274,8 +274,19 @@ def validate_url(url: str, args: Dict[str, Any]) -> Dict[str, Any]:
             "error_message": "URL 缺少主机名"
         }
 
-    # 3. SSRF 防护（基础检查，完整实现在 Todo 2.3）
+    # 检查白名单
     hostname = parsed.hostname or ""
+    allowed_hosts = _get_allowed_url_hosts()
+
+    if hostname in allowed_hosts:
+        return {
+            "valid": True,
+            "source_type": "url",
+            "source_value": url,
+            "allowlisted": True
+        }
+
+    # 3. SSRF 防护（基础检查，完整实现在 Todo 2.3）
     if hostname in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
         return {
             "valid": False,
@@ -299,6 +310,13 @@ def validate_url(url: str, args: Dict[str, Any]) -> Dict[str, Any]:
         "source_type": "url",
         "source_value": url
     }
+
+
+def _get_allowed_url_hosts() -> set:
+    """获取允许的 URL 主机名列表。"""
+    import os
+    hosts_raw = os.getenv("MCP_CONVERT_ALLOWED_URL_HOSTS", "")
+    return {h.strip().lower() for h in hosts_raw.split(",") if h.strip()}
 
 
 def validate_croc_code(croc_code: str, args: Dict[str, Any]) -> Dict[str, Any]:
