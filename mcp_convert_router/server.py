@@ -319,10 +319,22 @@ async def handle_convert_to_markdown(args: Dict[str, Any]) -> list[types.TextCon
                     max_file_mb = float(os.getenv("MCP_CONVERT_MAX_FILE_MB", str(max_file_mb)))
                 except Exception:
                     pass
+
+            # 提取 url_headers
+            url_headers = args.get("url_headers")
+            if url_headers and not isinstance(url_headers, dict):
+                result["error_code"] = "E_VALIDATION_FAILED"
+                result["error_message"] = "url_headers 必须是对象类型"
+                ctx.log_error(result["error_code"], result["error_message"])
+                ctx.log_complete(success=False)
+                clear_current_context()
+                return [types.TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
             download_result = await download_file_from_url(
                 url=source_value,
                 work_dir=work_dir,
-                max_bytes=max_file_mb * 1024 * 1024
+                max_bytes=max_file_mb * 1024 * 1024,
+                custom_headers=url_headers
             )
 
             # 将“下载阶段”纳入 attempts（可观测）
