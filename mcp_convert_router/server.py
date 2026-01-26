@@ -117,6 +117,15 @@ async def handle_list_tools() -> list[types.Tool]:
                         "type": "number",
                         "default": 300,
                         "description": "Croc 接收超时（秒）"
+                    },
+                    "url_headers": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                        "description": (
+                            "可选的 HTTP 请求头（用于需要认证的 URL）。\n"
+                            "例如: {\"Authorization\": \"Bearer sk-xxx\"}\n"
+                            "注意：请勿在日志中暴露敏感信息"
+                        )
                     }
                 },
                 "additionalProperties": False
