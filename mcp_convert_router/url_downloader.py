@@ -113,10 +113,7 @@ async def download_file_from_url(
     # 3. 确保输入目录存在
     input_dir = work_dir / "input"
     input_dir.mkdir(parents=True, exist_ok=True)
-
-    # 4. 从 URL 推断文件名
-    filename = _extract_filename_from_url(url)
-    output_path = input_dir / filename
+    # 文件名将在获得响应头后提取
 
     # 5. 下载文件
     try:
@@ -175,6 +172,10 @@ async def download_file_from_url(
                     result["error_code"] = "E_URL_HTTP_ERROR"
                     result["error_message"] = f"HTTP 错误: {response.status_code}"
                     break
+
+                # 从响应提取文件名
+                filename = _extract_filename_from_response(response, current_url)
+                output_path = input_dir / filename
 
                 # 检查 Content-Length（仅作参考，不可信）
                 content_length = response.headers.get("content-length")
@@ -303,21 +304,53 @@ def _is_private_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return False
 
 
+def _extract_filename_from_response(response: httpx.Response, url: str) -> str:
+    """从响应中提取文件名，优先使用 Content-Disposition。"""
+    content_disposition = response.headers.get("content-disposition", "")
+
+    if content_disposition:
+        import re
+        from urllib.parse import unquote
+
+        # RFC 5987: filename*=UTF-8''encoded
+        match = re.search(r"filename\*=([^']+)''(.+)", content_disposition)
+        if match:
+            encoded_filename = match.group(2)
+            try:
+                filename = unquote(encoded_filename)
+                filename = filename.replace("/", "_").replace("\\", "_")
+                filename = re.sub(r'[<>:"|?*]', "_", filename)
+                if filename and filename not in (".", ".."):
+                    return filename
+            except Exception:
+                pass
+
+        # RFC 2183: filename="name"
+        match = re.search(r'filename="?([^";\r\n]+)"?', content_disposition)
+        if match:
+            filename = match.group(1).strip()
+            filename = filename.replace("/", "_").replace("\\", "_")
+            filename = re.sub(r'[<>:"|?*]', "_", filename)
+            if filename and filename not in (".", ".."):
+                return filename
+
+    return _extract_filename_from_url(url)
+
+
 def _extract_filename_from_url(url: str) -> str:
     """从 URL 中提取文件名。"""
+    from urllib.parse import urlparse
+    import re
+
     parsed = urlparse(url)
     path = parsed.path
 
-    # 从路径中提取文件名
     if path:
         filename = path.split("/")[-1]
-        # 移除查询参数
         if "?" in filename:
             filename = filename.split("?")[0]
-        # 清理文件名
         filename = re.sub(r'[<>:"|?*]', "_", filename)
-        if filename and filename != "":
+        if filename:
             return filename
 
-    # 无法提取文件名，使用默认名
     return "downloaded_file"
