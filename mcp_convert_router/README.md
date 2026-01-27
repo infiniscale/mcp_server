@@ -335,6 +335,31 @@ mcp_convert_router/
     └── legacy_office_engine.py  # 旧格式转换（doc/xls/ppt）
 ```
 
+## OpenWebUI Integration
+
+### Native MCP Support (v0.6.31+)
+
+OpenWebUI natively supports MCP via streamable_http transport.
+
+**Quick Setup:**
+
+1. Start MCP server:
+```bash
+export MCP_TRANSPORT=streamable_http
+export MCP_CONVERT_ALLOWED_URL_HOSTS="openwebui,localhost"
+python -m mcp_convert_router.server
+```
+
+2. Configure in OpenWebUI:
+   - Admin Settings → External Tools → Add Server
+   - Type: MCP (Streamable HTTP)
+   - URL: http://mcp-convert-router:25081
+   - Auth: None
+
+3. Use tools directly in chat
+
+See [docs/openwebui/README.md](../docs/openwebui/README.md) for details.
+
 ## 测试
 
 ```bash
