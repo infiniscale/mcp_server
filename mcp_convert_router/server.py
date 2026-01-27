@@ -22,7 +22,7 @@ from .routing import choose_engine, SUPPORTED_EXTENSIONS
 from .validators import validate_input, ValidationError
 from .storage import StorageManager
 from .file_detector import detect_file_type, detect_file_type_with_security
-from .logging_utils import RequestContext, set_current_context, clear_current_context
+from .logging_utils import RequestContext, set_current_context, clear_current_context, logger
 
 # 初始化服务器
 server = Server("mcp-convert-router")
