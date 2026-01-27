@@ -262,6 +262,9 @@ async def handle_convert_to_markdown(args: Dict[str, Any]) -> list[types.TextCon
     """处理 convert_to_markdown 工具调用。"""
     import json
 
+    # 【诊断日志】记录完整的请求参数
+    logger.info(f"[DEBUG] convert_to_markdown 收到的完整参数: {json.dumps(args, ensure_ascii=False, indent=2)}")
+
     # 创建请求上下文
     ctx = RequestContext()
     set_current_context(ctx)
