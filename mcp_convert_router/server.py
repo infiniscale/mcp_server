@@ -46,7 +46,7 @@ async def handle_list_tools() -> list[types.Tool]:
                 "4. 若引擎不可用 → 本工具会返回 next_action 建议\n\n"
                 "## 快速使用\n"
                 "只需填写 source 参数，系统自动识别类型：\n"
-                "- 服务端本地文件: source='/data/report.pdf'\n"
+                # "- 服务端本地文件: source='/data/report.pdf'\n"
                 "- 网络文件: source='https://example.com/doc.pdf'\n"
                 "- 跨机器传输: source='78ayx1'（Croc Code，需先在客户端调用 croc_send 获取）\n\n"
                 "## 跨机器传输流程\n"
@@ -63,17 +63,17 @@ async def handle_list_tools() -> list[types.Tool]:
                     "source": {
                         "type": "string",
                         "description": (
-                            "【推荐】文件来源，自动识别类型。支持三种格式：\n"
-                            "- 本地路径: /path/to/file.pdf\n"
+                            "【推荐】文件来源，自动识别类型。支持两种格式：\n"
+                            # "- 本地路径: /path/to/file.pdf\n"
                             "- URL: https://example.com/file.pdf\n"
                             "- Croc Code: 7928-alpha-bravo（需先在远程机器调用 croc_send 获取）"
                         )
                     },
                     # === 兼容旧参数（仍可使用）===
-                    "file_path": {
-                        "type": "string",
-                        "description": "服务端本地文件路径（可用 source 代替）"
-                    },
+                    # "file_path": {
+                    #     "type": "string",
+                    #     "description": "服务端本地文件路径（可用 source 代替）"
+                    # },
                     "url": {
                         "type": "string",
                         "description": "远端文件 URL（可用 source 代替）"
@@ -349,18 +349,19 @@ async def handle_convert_to_markdown(args: Dict[str, Any]) -> list[types.TextCon
         work_dir = storage.create_work_dir()
         result["artifacts"]["work_dir"] = str(work_dir)
 
-        if source_type == "file_path":
-            file_path = Path(source_value)
-            if not file_path.exists():
-                result["error_code"] = "E_FILE_NOT_FOUND"
-                result["error_message"] = f"文件不存在: {source_value}"
-                ctx.log_error(result["error_code"], result["error_message"])
-                ctx.log_complete(success=False)
-                clear_current_context()
-                return [types.TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
-            ctx.log_file_received(file_path.name, file_path.stat().st_size)
+        # === file_path 功能已禁用（OpenWebUI 集成不使用本地文件路径）===
+        # if source_type == "file_path":
+        #     file_path = Path(source_value)
+        #     if not file_path.exists():
+        #         result["error_code"] = "E_FILE_NOT_FOUND"
+        #         result["error_message"] = f"文件不存在: {source_value}"
+        #         ctx.log_error(result["error_code"], result["error_message"])
+        #         ctx.log_complete(success=False)
+        #         clear_current_context()
+        #         return [types.TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+        #     ctx.log_file_received(file_path.name, file_path.stat().st_size)
 
-        elif source_type == "url":
+        if source_type == "url":
             # URL 下载
             from .url_downloader import download_file_from_url
             max_file_mb = args.get("max_file_mb", 50)
