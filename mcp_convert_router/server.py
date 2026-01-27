@@ -286,16 +286,26 @@ async def handle_convert_to_markdown(args: Dict[str, Any]) -> list[types.TextCon
     # 【OpenWebUI 文件处理】自动处理 __files__ 参数
     files = args.get("__files__", [])
     if files and not args.get("source"):
-        # 提取第一个文件的 URL
         file_info = files[0]
-        file_url = file_info.get("url", "")
 
-        if file_url:
-            logger.info(f"[OpenWebUI] 检测到上传文件，URL: {file_url}")
+        # OpenWebUI 的 url 字段只是 file_id，需要拼接完整 URL
+        file_id = file_info.get("url") or file_info.get("id")
+
+        if file_id:
+            # 从环境变量获取 OpenWebUI 基础 URL
+            import os
+            openwebui_base = os.getenv("OPENWEBUI_BASE_URL", "http://192.168.1.236:22030")
+            openwebui_base = openwebui_base.rstrip("/")  # 移除末尾斜杠
+
+            # 拼接完整的文件下载 URL
+            file_url = f"{openwebui_base}/api/v1/files/{file_id}/content"
+
+            logger.info(f"[OpenWebUI] 检测到上传文件，file_id: {file_id}")
+            logger.info(f"[OpenWebUI] 拼接的文件 URL: {file_url}")
+
             args["source"] = file_url
 
-            # 如果 URL 包含认证信息或需要认证，从环境变量获取
-            import os
+            # 添加认证头（如果配置了 API Key）
             openwebui_api_key = os.getenv("OPENWEBUI_API_KEY", "")
             if openwebui_api_key and not args.get("url_headers"):
                 args["url_headers"] = {
