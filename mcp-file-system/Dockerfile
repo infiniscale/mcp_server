@@ -17,11 +17,11 @@ RUN go build -ldflags="-s -w" -o server .
 
 FROM alpine:latest
 
-
 WORKDIR /app
 
 ARG CROC_VERSION=10.3.1
 
+# Install croc for cross-machine file transfer
 RUN apk add --no-cache curl ca-certificates tar \
  && curl -fL https://github.com/schollz/croc/releases/download/v${CROC_VERSION}/croc_v${CROC_VERSION}_Linux-64bit.tar.gz \
     -o /tmp/croc.tar.gz \
@@ -30,8 +30,24 @@ RUN apk add --no-cache curl ca-certificates tar \
  && chmod +x /usr/local/bin/croc \
  && rm -rf /tmp/*
 
+# Create non-root user with proper home directory
+# This is required for croc to write its config files to $HOME/.config/croc
+RUN addgroup -S app \
+ && adduser -S -G app -h /home/app app \
+ && mkdir -p /home/app/.config \
+ && chown -R app:app /home/app
+
 # Copy the built binary from the builder stage
 COPY --from=builder /app/server ./
+
+# Ensure app user can access the working directory
+RUN chown -R app:app /app
+
+# Switch to non-root user
+USER app
+
+# Set HOME explicitly for croc config directory
+ENV HOME=/home/app
 
 # The container will by default pass '/app' as the allowed directory if no other command line arguments are provided
 ENTRYPOINT ["./server"]
