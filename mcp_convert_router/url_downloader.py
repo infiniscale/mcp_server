@@ -120,11 +120,17 @@ async def download_file_from_url(
         # 准备请求头
         headers = custom_headers.copy() if custom_headers else {}
 
+        # TLS 验证控制
+        import os
+        tls_verify_str = os.getenv("MCP_CONVERT_URL_TLS_VERIFY", "true").strip().lower()
+        tls_verify = tls_verify_str not in ("false", "0", "no", "off")
+
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(connect=connect_timeout, read=read_timeout, write=30, pool=30),
             follow_redirects=False,  # 手动处理重定向以检查每个目标
             max_redirects=0,
-            headers=headers
+            headers=headers,
+            verify=tls_verify
         ) as client:
 
             current_url = url
