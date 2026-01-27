@@ -26,6 +26,9 @@ SHORT_CROC_CODE_PATTERN = re.compile(r"^[a-zA-Z0-9]{6,32}$")
 # URL 协议正则
 URL_PATTERN = re.compile(r"^https?://", re.IGNORECASE)
 
+# OpenWebUI file_id 格式正则 (UUID: 8-4-4-4-12 格式)
+OPENWEBUI_FILE_ID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+
 
 class ValidationError(Exception):
     """验证错误。"""
