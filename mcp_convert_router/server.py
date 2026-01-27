@@ -126,6 +126,24 @@ async def handle_list_tools() -> list[types.Tool]:
                             "例如: {\"Authorization\": \"Bearer sk-xxx\"}\n"
                             "注意：请勿在日志中暴露敏感信息"
                         )
+                    },
+                    # === OpenWebUI 文件上传支持 ===
+                    "__files__": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string"},
+                                "filename": {"type": "string"},
+                                "url": {"type": "string"},
+                                "type": {"type": "string"}
+                            }
+                        },
+                        "description": (
+                            "OpenWebUI 上传的文件列表（由 OpenWebUI 自动填充）。\n"
+                            "每个文件包含 id、filename、url、type 字段。\n"
+                            "工具会自动从第一个文件的 URL 下载文件。"
+                        )
                     }
                 },
                 "additionalProperties": False
@@ -264,6 +282,26 @@ async def handle_convert_to_markdown(args: Dict[str, Any]) -> list[types.TextCon
 
     # 【诊断日志】记录完整的请求参数
     logger.info(f"[DEBUG] convert_to_markdown 收到的完整参数: {json.dumps(args, ensure_ascii=False, indent=2)}")
+
+    # 【OpenWebUI 文件处理】自动处理 __files__ 参数
+    files = args.get("__files__", [])
+    if files and not args.get("source"):
+        # 提取第一个文件的 URL
+        file_info = files[0]
+        file_url = file_info.get("url", "")
+
+        if file_url:
+            logger.info(f"[OpenWebUI] 检测到上传文件，URL: {file_url}")
+            args["source"] = file_url
+
+            # 如果 URL 包含认证信息或需要认证，从环境变量获取
+            import os
+            openwebui_api_key = os.getenv("OPENWEBUI_API_KEY", "")
+            if openwebui_api_key and not args.get("url_headers"):
+                args["url_headers"] = {
+                    "Authorization": f"Bearer {openwebui_api_key}"
+                }
+                logger.info(f"[OpenWebUI] 已添加认证头")
 
     # 创建请求上下文
     ctx = RequestContext()
