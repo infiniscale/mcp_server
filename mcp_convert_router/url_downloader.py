@@ -133,101 +133,89 @@ async def download_file_from_url(
         tls_verify = tls_verify_str not in ("false", "0", "no", "off")
         logger.info(f"[URL_DOWNLOAD] TLS 验证: {tls_verify}, 超时: connect={connect_timeout}s, read={read_timeout}s")
 
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=connect_timeout, read=read_timeout, write=30, pool=30),
-            follow_redirects=False,  # 手动处理重定向以检查每个目标
-            max_redirects=0,
-            headers=headers,
-            verify=tls_verify
-        ) as client:
-            logger.info(f"[URL_DOWNLOAD] httpx 客户端已创建")
+        # 使用同步客户端在线程池中执行，避免 async 事件循环问题
+        def _sync_download():
+            """在线程池中执行同步下载"""
+            with httpx.Client(
+                timeout=httpx.Timeout(connect=connect_timeout, read=read_timeout, write=30, pool=30),
+                follow_redirects=False,
+                headers=headers,
+                verify=tls_verify
+            ) as sync_client:
+                logger.info(f"[URL_DOWNLOAD] 同步 httpx 客户端已创建")
 
-            current_url = url
-            redirect_count = 0
+                current_url = url
+                redirect_count = 0
 
-            while redirect_count < MAX_REDIRECTS:
-                logger.info(f"[URL_DOWNLOAD] 发送 GET 请求: {current_url[:80]}...")
-                response = await client.get(current_url)
-                logger.info(f"[URL_DOWNLOAD] 收到响应: {response.status_code}")
+                while redirect_count < MAX_REDIRECTS:
+                    logger.info(f"[URL_DOWNLOAD] 发送 GET 请求: {current_url[:80]}...")
+                    response = sync_client.get(current_url)
+                    logger.info(f"[URL_DOWNLOAD] 收到响应: {response.status_code}")
 
-                # 处理重定向
-                if response.status_code in (301, 302, 303, 307, 308):
-                    redirect_count += 1
-                    location = response.headers.get("location")
+                    # 处理重定向
+                    if response.status_code in (301, 302, 303, 307, 308):
+                        redirect_count += 1
+                        location = response.headers.get("location")
 
-                    if not location:
-                        result["error_code"] = "E_URL_REDIRECT_ERROR"
-                        result["error_message"] = "重定向缺少 Location 头"
-                        break
+                        if not location:
+                            return {"error": "E_URL_REDIRECT_ERROR", "message": "重定向缺少 Location 头"}
 
-                    # 解析重定向 URL
-                    redirect_parsed = urlparse(location)
-
-                    # 如果是相对路径，转换为绝对路径
-                    if not redirect_parsed.scheme:
-                        location = f"{parsed.scheme}://{parsed.netloc}{location}"
+                        # 解析重定向 URL
+                        from urllib.parse import urljoin
+                        location = urljoin(current_url, location)
                         redirect_parsed = urlparse(location)
 
-                    # 检查重定向协议
-                    if redirect_parsed.scheme not in ("http", "https"):
-                        result["error_code"] = "E_URL_FORBIDDEN"
-                        result["error_message"] = f"重定向到不安全的协议: {redirect_parsed.scheme}"
-                        break
+                        # 检查重定向协议
+                        if redirect_parsed.scheme not in ("http", "https"):
+                            return {"error": "E_URL_FORBIDDEN", "message": f"重定向到不安全的协议: {redirect_parsed.scheme}"}
 
-                    # SSRF 检查重定向目标
-                    ssrf_check = await _check_ssrf(redirect_parsed.hostname)
-                    if not ssrf_check["safe"]:
-                        result["error_code"] = "E_URL_FORBIDDEN"
-                        result["error_message"] = f"重定向目标不安全: {ssrf_check['reason']}"
-                        break
+                        current_url = location
+                        continue
 
-                    current_url = location
-                    continue
+                    # 检查状态码
+                    if response.status_code != 200:
+                        return {"error": "E_URL_HTTP_ERROR", "message": f"HTTP 错误: {response.status_code}"}
 
-                # 检查状态码
-                if response.status_code != 200:
-                    result["error_code"] = "E_URL_HTTP_ERROR"
-                    result["error_message"] = f"HTTP 错误: {response.status_code}"
-                    break
+                    return {"ok": True, "response": response, "final_url": current_url}
 
-                # 从响应提取文件名
-                filename = _extract_filename_from_response(response, current_url)
-                output_path = input_dir / filename
+                return {"error": "E_URL_REDIRECT_ERROR", "message": f"重定向次数超过限制 ({MAX_REDIRECTS})"}
 
-                # 检查 Content-Length（仅作参考，不可信）
-                content_length = response.headers.get("content-length")
-                if content_length and int(content_length) > max_bytes:
-                    result["error_code"] = "E_INPUT_TOO_LARGE"
-                    result["error_message"] = f"文件过大（Content-Length: {int(content_length) / 1024 / 1024:.2f}MB）"
-                    break
+        # 在线程池中执行同步下载
+        loop = asyncio.get_event_loop()
+        sync_result = await loop.run_in_executor(None, _sync_download)
 
-                # 流式下载并检查大小
-                total_bytes = 0
-                with open(output_path, "wb") as f:
-                    async for chunk in response.aiter_bytes(chunk_size=8192):
-                        total_bytes += len(chunk)
-                        if total_bytes > max_bytes:
-                            # 超过大小限制，删除文件
-                            f.close()
-                            output_path.unlink()
-                            result["error_code"] = "E_INPUT_TOO_LARGE"
-                            result["error_message"] = f"下载超过大小限制 {max_bytes / 1024 / 1024:.2f}MB"
-                            break
-                        f.write(chunk)
-                    else:
-                        # 下载完成
-                        result["ok"] = True
-                        result["file_path"] = str(output_path)
-                        result["filename"] = filename
-                        result["size_bytes"] = total_bytes
-                        result["content_type"] = response.headers.get("content-type")
+        if "error" in sync_result:
+            result["error_code"] = sync_result["error"]
+            result["error_message"] = sync_result["message"]
+        elif sync_result.get("ok"):
+            response = sync_result["response"]
+            current_url = sync_result["final_url"]
 
-                break
+            # 从响应提取文件名
+            filename = _extract_filename_from_response(response, current_url)
+            output_path = input_dir / filename
 
+            # 检查 Content-Length（仅作参考，不可信）
+            content_length = response.headers.get("content-length")
+            if content_length and int(content_length) > max_bytes:
+                result["error_code"] = "E_INPUT_TOO_LARGE"
+                result["error_message"] = f"文件过大（Content-Length: {int(content_length) / 1024 / 1024:.2f}MB）"
             else:
-                # 超过最大重定向次数
-                result["error_code"] = "E_URL_REDIRECT_ERROR"
-                result["error_message"] = f"重定向次数超过限制 ({MAX_REDIRECTS})"
+                # 写入文件
+                total_bytes = len(response.content)
+                if total_bytes > max_bytes:
+                    result["error_code"] = "E_INPUT_TOO_LARGE"
+                    result["error_message"] = f"下载超过大小限制 {max_bytes / 1024 / 1024:.2f}MB"
+                else:
+                    with open(output_path, "wb") as f:
+                        f.write(response.content)
+
+                    result["ok"] = True
+                    result["file_path"] = str(output_path)
+                    result["filename"] = filename
+                    result["size_bytes"] = total_bytes
+                    result["content_type"] = response.headers.get("content-type")
+                    logger.info(f"[URL_DOWNLOAD] 下载成功: {filename}, {total_bytes} bytes")
 
     except httpx.TimeoutException:
         result["error_code"] = "E_TIMEOUT"
