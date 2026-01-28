@@ -1,0 +1,123 @@
+# OpenWebUI Tools
+
+这个目录包含用于 OpenWebUI 的 Tool 脚本，用于与 MCP Convert Router 服务集成。
+
+## 文件列表
+
+| 文件 | 功能 |
+|------|------|
+| `file_to_markdown.py` | 准备文件转换参数，调用 MCP 进行 Markdown 转换 |
+
+## 安装方法
+
+### 1. 登录 OpenWebUI
+
+使用管理员账户登录 OpenWebUI。
+
+### 2. 进入 Tools 管理页面
+
+- 点击左侧菜单 **Workspace**
+- 选择 **Tools**
+- 点击 **+ Create a new tool**
+
+### 3. 复制脚本内容
+
+打开 `file_to_markdown.py` 文件，复制全部内容到 OpenWebUI 的 Tool 编辑器中。
+
+### 4. 保存
+
+点击 **Save** 保存 Tool。
+
+### 5. 配置（可选）
+
+在 Tool 的 Valves 配置中，可以修改：
+
+- **openwebui_base_url**: OpenWebUI 的基础 URL（默认：`http://192.168.1.236:22030`）
+
+## 使用方法
+
+### 前提条件
+
+1. MCP Convert Router 服务已部署并运行
+2. MCP 服务已通过 mcpo 代理连接到 OpenWebUI
+
+### 使用流程
+
+1. **上传文件**：在 OpenWebUI 对话界面上传文件（PDF、DOCX、图片等）
+
+2. **调用 Tool**：告诉 LLM 转换文件，例如：
+   ```
+   请使用 prepare_file_for_conversion 工具准备文件转换，file_id 是 f70823a3-5be7-444d-afc5-8dc906ee8494
+   ```
+
+3. **LLM 自动调用 MCP**：Tool 会返回调用指令，LLM 会自动调用 `convert_to_markdown` 工具完成转换
+
+### 参数说明
+
+| 参数 | 类型 | 必需 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| file_id | string | ✅ | - | 上传文件的 UUID |
+| enable_ocr | bool | ❌ | false | 是否启用 OCR（扫描件需要） |
+| language | string | ❌ | "ch" | OCR 语言（ch=中文, en=英文） |
+
+## 工作原理
+
+```
+用户上传文件到 OpenWebUI
+    ↓
+用户请求转换文件
+    ↓
+LLM 调用 prepare_file_for_conversion(file_id)
+    ↓
+Tool 脚本：
+  1. 拼接文件 URL: http://openwebui/api/v1/files/{file_id}/content
+  2. 获取当前用户的认证 Token
+  3. 返回调用指令
+    ↓
+LLM 调用 convert_to_markdown(source=URL, url_headers={...})
+    ↓
+MCP 服务：
+  1. 下载文件（带认证头）
+  2. 转换为 Markdown
+  3. 返回结果
+    ↓
+用户看到 Markdown 内容
+```
+
+## 职责划分
+
+| 组件 | 职责 |
+|------|------|
+| **Tool 脚本** | 获取 file_id → 拼接 URL → 准备认证头 → 返回调用指令 |
+| **MCP 服务** | 接收 URL → 下载文件 → 转换 Markdown → 返回结果 |
+
+## 故障排查
+
+### 问题：401 Unauthorized
+
+**原因**：认证头无效或未传递
+
+**解决**：
+- 确保用户已登录 OpenWebUI
+- 检查 `__user__` 参数是否包含有效的 token
+
+### 问题：文件不存在
+
+**原因**：file_id 无效或文件已被删除
+
+**解决**：
+- 确认文件已成功上传
+- 检查 file_id 格式是否正确（UUID 格式）
+
+### 问题：MCP 服务无响应
+
+**原因**：MCP 服务未运行或网络问题
+
+**解决**：
+- 检查 MCP 服务状态：`docker logs mcp-convert-router`
+- 检查 mcpo 代理状态：`docker logs mcpo`
+
+## 相关文档
+
+- [MCP Convert Router 文档](../mcp_convert_router/README.md)
+- [OpenWebUI 官方文档](https://docs.openwebui.com)
