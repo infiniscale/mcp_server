@@ -140,7 +140,8 @@ async def download_file_from_url(
                 timeout=httpx.Timeout(connect=connect_timeout, read=read_timeout, write=30, pool=30),
                 follow_redirects=False,
                 headers=headers,
-                verify=tls_verify
+                verify=tls_verify,
+                trust_env=False  # 禁用代理环境变量，避免内网请求被代理
             ) as sync_client:
                 logger.info(f"[URL_DOWNLOAD] 同步 httpx 客户端已创建")
 
