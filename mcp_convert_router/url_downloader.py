@@ -5,6 +5,7 @@
 
 import asyncio
 import ipaddress
+import logging
 import os
 import re
 import socket
@@ -14,6 +15,8 @@ from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 # 默认超时时间（秒）
 DEFAULT_CONNECT_TIMEOUT = 60
@@ -91,6 +94,7 @@ async def download_file_from_url(
 
     # 1. 协议检查
     parsed = urlparse(url)
+    logger.info(f"[URL_DOWNLOAD] 开始下载: {url[:80]}...")
     if parsed.scheme not in ("http", "https"):
         result["error_code"] = "E_URL_FORBIDDEN"
         result["error_message"] = f"不支持的协议: {parsed.scheme}。仅支持 http/https"
@@ -99,7 +103,9 @@ async def download_file_from_url(
 
     # 2. SSRF 防护：解析 DNS 并检查 IP
     try:
+        logger.info(f"[URL_DOWNLOAD] SSRF 检查: {parsed.hostname}")
         ssrf_check = await _check_ssrf(parsed.hostname)
+        logger.info(f"[URL_DOWNLOAD] SSRF 检查完成: {ssrf_check}")
         if not ssrf_check["safe"]:
             result["error_code"] = "E_URL_FORBIDDEN"
             result["error_message"] = ssrf_check["reason"]
@@ -120,10 +126,12 @@ async def download_file_from_url(
     try:
         # 准备请求头
         headers = custom_headers.copy() if custom_headers else {}
+        logger.info(f"[URL_DOWNLOAD] 准备 httpx 客户端, headers: {list(headers.keys())}")
 
         # TLS 验证控制
         tls_verify_str = os.getenv("MCP_CONVERT_URL_TLS_VERIFY", "true").strip().lower()
         tls_verify = tls_verify_str not in ("false", "0", "no", "off")
+        logger.info(f"[URL_DOWNLOAD] TLS 验证: {tls_verify}, 超时: connect={connect_timeout}s, read={read_timeout}s")
 
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(connect=connect_timeout, read=read_timeout, write=30, pool=30),
@@ -132,12 +140,15 @@ async def download_file_from_url(
             headers=headers,
             verify=tls_verify
         ) as client:
+            logger.info(f"[URL_DOWNLOAD] httpx 客户端已创建")
 
             current_url = url
             redirect_count = 0
 
             while redirect_count < MAX_REDIRECTS:
+                logger.info(f"[URL_DOWNLOAD] 发送 GET 请求: {current_url[:80]}...")
                 response = await client.get(current_url)
+                logger.info(f"[URL_DOWNLOAD] 收到响应: {response.status_code}")
 
                 # 处理重定向
                 if response.status_code in (301, 302, 303, 307, 308):
