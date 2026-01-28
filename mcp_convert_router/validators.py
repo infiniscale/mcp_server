@@ -317,7 +317,6 @@ def validate_url(url: str, args: Dict[str, Any]) -> Dict[str, Any]:
 
 def _get_allowed_url_hosts() -> set:
     """获取允许的 URL 主机名列表。"""
-    import os
     hosts_raw = os.getenv("MCP_CONVERT_ALLOWED_URL_HOSTS", "")
     return {h.strip().lower() for h in hosts_raw.split(",") if h.strip()}
 
