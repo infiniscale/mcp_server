@@ -5,6 +5,7 @@
 
 import asyncio
 import ipaddress
+import os
 import re
 import socket
 import time
@@ -121,7 +122,6 @@ async def download_file_from_url(
         headers = custom_headers.copy() if custom_headers else {}
 
         # TLS 验证控制
-        import os
         tls_verify_str = os.getenv("MCP_CONVERT_URL_TLS_VERIFY", "true").strip().lower()
         tls_verify = tls_verify_str not in ("false", "0", "no", "off")
 
@@ -238,7 +238,6 @@ async def _check_ssrf(hostname: str) -> Dict[str, Any]:
         return {"safe": False, "reason": "主机名为空", "ip": None}
 
     # 检查白名单
-    import os
     allowed_hosts = {h.strip().lower() for h in os.getenv("MCP_CONVERT_ALLOWED_URL_HOSTS", "").split(",") if h.strip()}
 
     if hostname.lower() in allowed_hosts:
