@@ -16,8 +16,8 @@ from urllib.parse import urlparse
 import httpx
 
 # 默认超时时间（秒）
-DEFAULT_CONNECT_TIMEOUT = 10
-DEFAULT_READ_TIMEOUT = 60
+DEFAULT_CONNECT_TIMEOUT = 60
+DEFAULT_READ_TIMEOUT = 600
 
 # 默认最大下载大小（字节）
 DEFAULT_MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024  # 50MB
