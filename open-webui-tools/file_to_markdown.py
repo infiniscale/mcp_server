@@ -2,7 +2,7 @@
 title: File to Markdown Converter
 author: MCP Convert Router Team
 author_url: https://github.com/infiniscale/mcp_server
-version: 2.1.0
+version: 2.1.1
 license: MIT
 description: Convert files to Markdown using MCP Convert Router service (via URL)
 requirements: httpx
@@ -11,6 +11,7 @@ requirements: httpx
 from pydantic import BaseModel, Field
 from typing import Optional
 import json
+import uuid
 import httpx
 
 
@@ -55,10 +56,10 @@ class Tools:
         IMPORTANT: The file_id is the UUID of the uploaded file.
         You can find it in the file metadata. For example:
         - If user uploaded a file, look for the file's id/uuid in the conversation context
-        - The file_id looks like: "2846f51d-5ee5-4c87-8452-d52ebd70b3b4"
+        - The file_id looks like: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
         - DO NOT pass Chinese text or descriptions as file_id
 
-        :param file_id: The UUID of the uploaded file (e.g., "2846f51d-5ee5-4c87-8452-d52ebd70b3b4")
+        :param file_id: The UUID of the uploaded file (e.g., "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
         :param enable_ocr: Enable OCR for scanned documents or images (default: False)
         :param language: OCR language - "ch" for Chinese, "en" for English (default: "ch")
         :return: The file content in Markdown format
@@ -68,8 +69,11 @@ class Tools:
             print(f"[FileToMD-URL] Converting file {file_id}")
 
             # Validate file_id
-            if not file_id or len(file_id) < 8:
-                return "错误：无效的文件 ID。请提供有效的文件 UUID。"
+            file_id = (file_id or "").strip()
+            try:
+                file_id = str(uuid.UUID(file_id))
+            except Exception:
+                return "错误：无效的 file_id。请从当前对话的附件信息中复制文件 UUID（形如 xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx）。"
 
             # Construct file URL
             openwebui_base = self.valves.openwebui_base_url.rstrip("/")

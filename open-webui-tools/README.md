@@ -50,7 +50,7 @@
 
 2. **调用 Tool**：告诉 LLM 转换文件，例如：
    ```
-   请使用 prepare_file_for_conversion 工具准备文件转换，file_id 是 f70823a3-5be7-444d-afc5-8dc906ee8494
+   请使用 prepare_file_for_conversion 工具准备文件转换，file_id 是 xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx（从当前对话附件中复制）
    ```
 
 3. **LLM 自动调用 MCP**：Tool 会返回调用指令，LLM 会自动调用 `convert_to_markdown` 工具完成转换

@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from typing import Optional
 import httpx
 import base64
+import uuid
 import os
 import glob
 
@@ -53,10 +54,10 @@ class Tools:
         IMPORTANT: The file_id is the UUID of the uploaded file.
         You can find it in the file metadata. For example:
         - If user uploaded a file, look for the file's id/uuid in the conversation context
-        - The file_id looks like: "2846f51d-5ee5-4c87-8452-d52ebd70b3b4"
+        - The file_id looks like: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
         - DO NOT pass Chinese text or descriptions as file_id
 
-        :param file_id: The UUID of the uploaded file (e.g., "2846f51d-5ee5-4c87-8452-d52ebd70b3b4")
+        :param file_id: The UUID of the uploaded file (e.g., "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
         :param enable_ocr: Enable OCR for scanned documents or images (default: False)
         :param language: OCR language - "ch" for Chinese, "en" for English (default: "ch")
         :return: The file content in Markdown format
@@ -64,6 +65,12 @@ class Tools:
 
         try:
             print(f"[FileToMD] Converting file {file_id}")
+
+            file_id = (file_id or "").strip()
+            try:
+                file_id = str(uuid.UUID(file_id))
+            except Exception:
+                return "错误：无效的 file_id。请从当前对话的附件信息中复制文件 UUID（形如 xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx）。"
 
             # Download file from local filesystem
             file_content, filename = self._download_file(file_id)
