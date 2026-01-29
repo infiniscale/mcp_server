@@ -22,7 +22,7 @@ from .routing import choose_engine, SUPPORTED_EXTENSIONS
 from .validators import validate_input, ValidationError
 from .storage import StorageManager
 from .file_detector import detect_file_type, detect_file_type_with_security
-from .logging_utils import RequestContext, set_current_context, clear_current_context
+from .logging_utils import RequestContext, set_current_context, clear_current_context, logger
 
 # 初始化服务器
 server = Server("mcp-convert-router")
@@ -117,6 +117,15 @@ async def handle_list_tools() -> list[types.Tool]:
                         "type": "number",
                         "default": 300,
                         "description": "Croc 接收超时（秒）"
+                    },
+                    "url_headers": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                        "description": (
+                            "可选的 HTTP 请求头（用于需要认证的 URL）。\n"
+                            "例如: {\"Authorization\": \"Bearer sk-xxx\"}\n"
+                            "注意：请勿在日志中暴露敏感信息"
+                        )
                     }
                 },
                 "additionalProperties": False
@@ -253,6 +262,9 @@ async def handle_convert_to_markdown(args: Dict[str, Any]) -> list[types.TextCon
     """处理 convert_to_markdown 工具调用。"""
     import json
 
+    # 【诊断日志】记录完整的请求参数
+    logger.info(f"[DEBUG] convert_to_markdown 收到的完整参数: {json.dumps(args, ensure_ascii=False, indent=2)}")
+
     # 创建请求上下文
     ctx = RequestContext()
     set_current_context(ctx)
@@ -310,10 +322,35 @@ async def handle_convert_to_markdown(args: Dict[str, Any]) -> list[types.TextCon
                     max_file_mb = float(os.getenv("MCP_CONVERT_MAX_FILE_MB", str(max_file_mb)))
                 except Exception:
                     pass
+
+            # 提取 url_headers
+            url_headers = args.get("url_headers")
+            if url_headers and not isinstance(url_headers, dict):
+                result["error_code"] = "E_VALIDATION_FAILED"
+                result["error_message"] = "url_headers 必须是对象类型"
+                ctx.log_error(result["error_code"], result["error_message"])
+                ctx.log_complete(success=False)
+                clear_current_context()
+                return [types.TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+            # 【自动添加 OpenWebUI 认证头】
+            # 如果 URL 是 OpenWebUI 文件 URL 且配置了 API Key，自动添加认证头
+            openwebui_base = os.getenv("OPENWEBUI_BASE_URL", "")
+            openwebui_api_key = os.getenv("OPENWEBUI_API_KEY", "")
+            if openwebui_base and openwebui_api_key:
+                # 检查 URL 是否匹配 OpenWebUI
+                if source_value.startswith(openwebui_base) or "/api/v1/files/" in source_value:
+                    if not url_headers:
+                        url_headers = {}
+                    if "Authorization" not in url_headers:
+                        url_headers["Authorization"] = f"Bearer {openwebui_api_key}"
+                        logger.info(f"[OpenWebUI] 自动添加认证头到 URL 下载请求")
+
             download_result = await download_file_from_url(
                 url=source_value,
                 work_dir=work_dir,
-                max_bytes=max_file_mb * 1024 * 1024
+                max_bytes=max_file_mb * 1024 * 1024,
+                custom_headers=url_headers
             )
 
             # 将“下载阶段”纳入 attempts（可观测）

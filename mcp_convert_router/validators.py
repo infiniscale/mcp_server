@@ -26,6 +26,9 @@ SHORT_CROC_CODE_PATTERN = re.compile(r"^[a-zA-Z0-9]{6,32}$")
 # URL 协议正则
 URL_PATTERN = re.compile(r"^https?://", re.IGNORECASE)
 
+# OpenWebUI file_id 格式正则 (UUID: 8-4-4-4-12 格式)
+OPENWEBUI_FILE_ID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+
 
 class ValidationError(Exception):
     """验证错误。"""
@@ -274,8 +277,19 @@ def validate_url(url: str, args: Dict[str, Any]) -> Dict[str, Any]:
             "error_message": "URL 缺少主机名"
         }
 
-    # 3. SSRF 防护（基础检查，完整实现在 Todo 2.3）
+    # 检查白名单
     hostname = parsed.hostname or ""
+    allowed_hosts = _get_allowed_url_hosts()
+
+    if hostname in allowed_hosts:
+        return {
+            "valid": True,
+            "source_type": "url",
+            "source_value": url,
+            "allowlisted": True
+        }
+
+    # 3. SSRF 防护（基础检查，完整实现在 Todo 2.3）
     if hostname in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
         return {
             "valid": False,
@@ -299,6 +313,12 @@ def validate_url(url: str, args: Dict[str, Any]) -> Dict[str, Any]:
         "source_type": "url",
         "source_value": url
     }
+
+
+def _get_allowed_url_hosts() -> set:
+    """获取允许的 URL 主机名列表。"""
+    hosts_raw = os.getenv("MCP_CONVERT_ALLOWED_URL_HOSTS", "")
+    return {h.strip().lower() for h in hosts_raw.split(",") if h.strip()}
 
 
 def validate_croc_code(croc_code: str, args: Dict[str, Any]) -> Dict[str, Any]:

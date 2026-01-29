@@ -167,6 +167,8 @@ FastMCP-based MinerU API wrapper.
 | `MCP_CONVERT_TEMP_DIR` | `/tmp/mcp-convert` | Temp directory |
 | `MCP_CONVERT_MAX_FILE_MB` | `50` | Max file size |
 | `MCP_CONVERT_ALLOWED_INPUT_ROOTS` | - | Whitelist for local paths (comma-separated) |
+| `MCP_CONVERT_ALLOWED_URL_HOSTS` | - | Whitelist for URL hosts (bypasses SSRF) |
+| `MCP_CONVERT_URL_TLS_VERIFY` | `true` | TLS certificate verification |
 | `MINERU_API_KEY` | - | MinerU API key |
 | `USE_LOCAL_API` | `false` | Use local MinerU instead of cloud |
 | `MCP_TRANSPORT` | `stdio` | Transport mode (stdio/sse/streamable-http) |
