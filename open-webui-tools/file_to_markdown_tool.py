@@ -4,17 +4,18 @@ author: MCP Convert Router Team
 author_url: https://github.com/infiniscale/mcp_server
 version: 1.0.0
 license: MIT
-description: Convert files to Markdown using MCP Convert Router service
+description: (Legacy) Convert files to Markdown using MCP Convert Router service
 requirements: httpx
 """
 
-from pydantic import BaseModel, Field
-from typing import Optional
-import httpx
 import base64
-import uuid
-import os
 import glob
+import os
+import uuid
+from typing import Optional
+
+import httpx
+from pydantic import BaseModel, Field
 
 
 class Tools:

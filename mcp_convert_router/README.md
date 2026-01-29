@@ -360,6 +360,15 @@ python -m mcp_convert_router.server
 
 See [docs/openwebui/README.md](../docs/openwebui/README.md) for details.
 
+### OpenWebUI Tool Script（备选）
+
+如果你无法使用 OpenWebUI 原生 MCP（或希望在 OpenWebUI 内用 Tool 脚本触发转换），可使用本仓库的 `open-webui-tools/file_to_markdown.py`。
+
+- 工具会从当前消息附件（`__files__`）读取文件；在 “重新生成（Regenerate）” 场景下也会从历史消息（`__messages__`）回溯最近一次上传的文件。
+- 建议 MCP 地址使用以 `/mcp/` 结尾的 URL，避免 `POST /mcp → /mcp/` 的 307 重定向。
+
+详见：`open-webui-tools/README.md`。
+
 ## 测试
 
 ```bash

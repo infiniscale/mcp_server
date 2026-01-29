@@ -2,17 +2,18 @@
 title: File to Markdown Converter
 author: MCP Convert Router Team
 author_url: https://github.com/infiniscale/mcp_server
-version: 2.2.0
+version: 2.3.0
 license: MIT
 description: Convert files to Markdown using MCP Convert Router service (via URL)
 requirements: httpx
 """
 
-from pydantic import BaseModel, Field
-from typing import Any, Optional
 import json
 import uuid
+from typing import Any, Optional
+
 import httpx
+from pydantic import BaseModel, Field
 
 
 class Tools:
@@ -45,6 +46,7 @@ class Tools:
         language: str = "ch",
         __user__: Optional[dict] = None,
         __files__: Optional[list] = None,
+        __messages__: Optional[list] = None,
         __oauth_token__: Optional[dict] = None,
         __event_emitter__: Any = None,
     ) -> str:
@@ -59,6 +61,8 @@ class Tools:
         IMPORTANT:
         - You do NOT need to provide file_id manually.
         - This tool will use __files__ (the current message attachments) as the source of truth.
+        - If __files__ is missing (e.g., when user clicks Regenerate), it will fall back to the
+          latest message in __messages__ that contains files.
         - If multiple files are attached, it will convert all of them.
 
         :param file_id: (Optional) A file UUID. Ignored when __files__ is present.
@@ -71,6 +75,9 @@ class Tools:
             openwebui_base = self.valves.openwebui_base_url.rstrip("/")
 
             file_infos = self._extract_file_infos(__files__)
+
+            if not file_infos:
+                file_infos = self._extract_latest_file_infos_from_messages(__messages__)
 
             if not file_infos:
                 # Backward compatibility: allow explicit file_id when __files__ isn't available.
@@ -145,6 +152,16 @@ class Tools:
         return {}
 
     @staticmethod
+    def _normalize_mcp_url(mcp_url: str) -> str:
+        """
+        Ensure trailing slash to avoid 307 redirects (e.g. POST /mcp -> /mcp/).
+        """
+        url = (mcp_url or "").strip()
+        if not url:
+            return url
+        return url.rstrip("/") + "/"
+
+    @staticmethod
     def _extract_file_infos(files: Optional[list]) -> list[dict]:
         infos: list[dict] = []
 
@@ -176,9 +193,33 @@ class Tools:
             except Exception:
                 continue
 
-            infos.append({"id": file_uuid, "name": str(candidate_name) if candidate_name else file_uuid})
+            infos.append(
+                {
+                    "id": file_uuid,
+                    "name": str(candidate_name) if candidate_name else file_uuid,
+                }
+            )
 
         return infos
+
+    @classmethod
+    def _extract_latest_file_infos_from_messages(cls, messages: Optional[list]) -> list[dict]:
+        """
+        Regenerate may omit __files__. Recover by scanning __messages__ from newest to oldest
+        and returning the first message that contains attached files.
+        """
+        if not messages or not isinstance(messages, list):
+            return []
+
+        for msg in reversed(messages):
+            if not isinstance(msg, dict):
+                continue
+            files = msg.get("files")
+            infos = cls._extract_file_infos(files) if isinstance(files, list) else []
+            if infos:
+                return infos
+
+        return []
 
     async def _call_mcp(self, file_url: str, url_headers: dict, enable_ocr: bool, language: str) -> str:
         """Call MCP Convert Router service via JSON-RPC with URL source"""
@@ -195,6 +236,7 @@ class Tools:
             arguments["url_headers"] = url_headers
 
         timeout = httpx.Timeout(self.valves.timeout_seconds)
+        mcp_url = self._normalize_mcp_url(self.valves.mcp_url)
 
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             payload = {
@@ -212,7 +254,7 @@ class Tools:
                 "Accept": "application/json, text/event-stream",
             }
 
-            async with client.stream("POST", self.valves.mcp_url, json=payload, headers=headers) as response:
+            async with client.stream("POST", mcp_url, json=payload, headers=headers) as response:
                 print(f"[FileToMD-URL] MCP response status: {response.status_code}")
 
                 if response.status_code != 200:

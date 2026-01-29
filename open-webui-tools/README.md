@@ -6,7 +6,8 @@
 
 | 文件 | 功能 |
 |------|------|
-| `file_to_markdown.py` | 准备文件转换参数，调用 MCP 进行 Markdown 转换 |
+| `file_to_markdown.py` | （推荐）通过 OpenWebUI File API 的 URL 下载文件，调用 MCP Convert Router 转 Markdown |
+| `file_to_markdown_tool.py` | （旧版/不推荐）从 OpenWebUI 容器本地磁盘读取文件并 base64 上传给 MCP（仅在同容器/共享卷场景可用） |
 
 ## 安装方法
 
@@ -54,13 +55,23 @@
    ```
    如果一次上传了多个文件，工具会依次转换并把结果按文件名分段返回。
 
-3. **LLM 自动调用 MCP**：Tool 会返回调用指令，LLM 会自动调用 `convert_to_markdown` 工具完成转换
+3. **Tool 直接调用 MCP**：`file_to_markdown.py` 会直接向 MCP Convert Router 发起 JSON-RPC 请求并返回 Markdown（不需要二次“工具调用”）。
+
+### Regenerate（重新生成）说明
+
+OpenWebUI 的 “重新生成（Regenerate）” 有时不会把当前消息的 `__files__` 再次注入到 Tool 运行时。
+
+为保证稳定性，`file_to_markdown.py` 会按以下顺序选择要转换的文件：
+
+1. `__files__`（当前消息附件）
+2. `__messages__` 中最近一条带 `files` 的消息（用于 Regenerate 场景）
+3. 显式传入的 `file_id`（兼容旧用法；只有前两者都缺失时才会使用）
 
 ### 参数说明
 
 | 参数 | 类型 | 必需 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| file_id | string | ✅ | - | 上传文件的 UUID |
+| file_id | string | ❌ | - | （可选）上传文件的 UUID；通常不需要手动填写 |
 | enable_ocr | bool | ❌ | false | 是否启用 OCR（扫描件需要） |
 | language | string | ❌ | "ch" | OCR 语言（ch=中文, en=英文） |
 
@@ -71,14 +82,11 @@
     ↓
 用户请求转换文件
     ↓
-LLM 调用 prepare_file_for_conversion(file_id)
-    ↓
 Tool 脚本：
-  1. 拼接文件 URL: http://openwebui/api/v1/files/{file_id}/content
-  2. 获取当前用户的认证 Token
-  3. 返回调用指令
-    ↓
-LLM 调用 convert_to_markdown(source=URL, url_headers={...})
+  1. 从 __files__/__messages__ 提取 file_id
+  2. 拼接文件 URL: http://openwebui/api/v1/files/{file_id}/content
+  3. 组装 Authorization 头（优先 OAuth，其次 __user__.token，再其次 valves.openwebui_api_key）
+  4. 调用 MCP Convert Router（JSON-RPC）
     ↓
 MCP 服务：
   1. 下载文件（带认证头）
@@ -92,7 +100,7 @@ MCP 服务：
 
 | 组件 | 职责 |
 |------|------|
-| **Tool 脚本** | 获取 file_id → 拼接 URL → 准备认证头 → 返回调用指令 |
+| **Tool 脚本** | 获取 file_id → 拼接 URL → 准备认证头 → 调用 MCP → 返回结果 |
 | **MCP 服务** | 接收 URL → 下载文件 → 转换 Markdown → 返回结果 |
 
 ## 故障排查
@@ -131,6 +139,12 @@ MCP 服务：
 - 优先用 OpenWebUI 原生 MCP（见 `docs/openwebui/README.md`），避免 Tool 脚本同步阻塞 OpenWebUI。
 - 或者把 OpenWebUI 配置为可并发处理请求（例如多 worker / 多线程），保证 Tool 执行期间 `/api/v1/files/.../content` 仍可被访问。
 - 使用本仓库 `file_to_markdown.py` v2.1.0+（`convert_file` 为 async），减少阻塞概率（取决于 OpenWebUI Tool 运行方式）。
+
+### 问题：工具执行成功，但聊天回复里看不到结果
+
+如果你的 LLM Provider 连接不稳定（OpenWebUI 日志出现 `open_webui.routers.openai:send_get_request Connection error`），可能导致“最终回复”异常。
+
+这不影响 Tool/MCP 的实际执行结果：转换结果通常仍会写入该条 assistant message 的 `sources` 字段中。
 
 ## 相关文档
 
