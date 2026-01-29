@@ -2,7 +2,7 @@
 title: File to Markdown Converter
 author: MCP Convert Router Team
 author_url: https://github.com/infiniscale/mcp_server
-version: 2.0.0
+version: 2.1.0
 license: MIT
 description: Convert files to Markdown using MCP Convert Router service (via URL)
 requirements: httpx
@@ -10,6 +10,7 @@ requirements: httpx
 
 from pydantic import BaseModel, Field
 from typing import Optional
+import json
 import httpx
 
 
@@ -23,6 +24,10 @@ class Tools:
             default="http://192.168.1.236:22030",
             description="OpenWebUI base URL for constructing file download URLs"
         )
+        openwebui_api_key: str = Field(
+            default="",
+            description="Optional OpenWebUI API key (used if __user__.token is missing)"
+        )
         timeout_seconds: int = Field(
             default=600,
             description="Timeout for MCP processing in seconds"
@@ -32,7 +37,7 @@ class Tools:
         self.valves = self.Valves()
         print("[FileToMD-URL] Tool initialized")
 
-    def convert_file(
+    async def convert_file(
         self,
         file_id: str,
         enable_ocr: bool = False,
@@ -81,10 +86,12 @@ class Tools:
             url_headers = {}
             if user_token:
                 url_headers["Authorization"] = f"Bearer {user_token}"
+            elif self.valves.openwebui_api_key:
+                url_headers["Authorization"] = f"Bearer {self.valves.openwebui_api_key}"
 
             # Call MCP
             print(f"[FileToMD-URL] Calling MCP at {self.valves.mcp_url}...")
-            markdown = self._call_mcp(file_url, url_headers, enable_ocr, language)
+            markdown = await self._call_mcp(file_url, url_headers, enable_ocr, language)
             print(f"[FileToMD-URL] Success, got {len(markdown)} chars")
 
             return markdown
@@ -96,10 +103,8 @@ class Tools:
             traceback.print_exc()
             return error_msg
 
-    def _call_mcp(self, file_url: str, url_headers: dict, enable_ocr: bool, language: str) -> str:
+    async def _call_mcp(self, file_url: str, url_headers: dict, enable_ocr: bool, language: str) -> str:
         """Call MCP Convert Router service via JSON-RPC with URL source"""
-        import json
-
         # Build arguments
         arguments = {
             "source": file_url,
@@ -112,68 +117,78 @@ class Tools:
         if url_headers:
             arguments["url_headers"] = url_headers
 
-        with httpx.Client(timeout=self.valves.timeout_seconds) as client:
-            # Use JSON-RPC format to call MCP
-            # Important: Must include Accept header for SSE response
-            response = client.post(
-                self.valves.mcp_url,
-                json={
-                    "jsonrpc": "2.0",
-                    "id": "tool-call",
-                    "method": "tools/call",
-                    "params": {
-                        "name": "convert_to_markdown",
-                        "arguments": arguments
-                    }
+        timeout = httpx.Timeout(self.valves.timeout_seconds)
+
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            payload = {
+                "jsonrpc": "2.0",
+                "id": "tool-call",
+                "method": "tools/call",
+                "params": {
+                    "name": "convert_to_markdown",
+                    "arguments": arguments,
                 },
-                headers={
-                    "Content-Type": "application/json",
-                    "Accept": "application/json, text/event-stream"
-                }
-            )
+            }
 
-            print(f"[FileToMD-URL] MCP response status: {response.status_code}")
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+            }
 
-            if response.status_code != 200:
-                raise Exception(f"MCP 错误 (HTTP {response.status_code}): {response.text[:200]}")
+            async with client.stream("POST", self.valves.mcp_url, json=payload, headers=headers) as response:
+                print(f"[FileToMD-URL] MCP response status: {response.status_code}")
 
-            # Parse SSE response format
-            # Response format: "event: message\r\ndata: {...json...}"
-            response_text = response.text
-            print(f"[FileToMD-URL] Raw response length: {len(response_text)}")
+                if response.status_code != 200:
+                    body = (await response.aread()).decode("utf-8", errors="replace")
+                    raise Exception(f"MCP 错误 (HTTP {response.status_code}): {body[:200]}")
 
-            # Extract JSON from SSE data line
-            json_data = None
-            for line in response_text.split("\n"):
-                line = line.strip()
-                if line.startswith("data:"):
-                    json_str = line[5:].strip()  # Remove "data:" prefix
-                    json_data = json.loads(json_str)
-                    break
+                content_type = (response.headers.get("Content-Type") or "").lower()
+                if "text/event-stream" not in content_type:
+                    body = (await response.aread()).decode("utf-8", errors="replace")
+                    try:
+                        json_data = json.loads(body)
+                    except Exception:
+                        raise Exception(f"无法解析 MCP 响应: {body[:200]}")
+                    return self._extract_markdown(json_data)
 
-            if not json_data:
-                # Try parsing as direct JSON (fallback)
-                try:
-                    json_data = json.loads(response_text)
-                except:
-                    raise Exception(f"无法解析 MCP 响应: {response_text[:200]}")
+                last_data = None
+                async for line in response.aiter_lines():
+                    line = (line or "").strip()
+                    if not line.startswith("data:"):
+                        continue
 
-            print(f"[FileToMD-URL] Parsed JSON-RPC response")
+                    json_str = line[5:].strip()
+                    if not json_str or json_str == "[DONE]":
+                        continue
 
-            # Check for JSON-RPC error
-            if "error" in json_data:
-                error_msg = json_data["error"].get("message", "未知错误")
-                raise Exception(f"MCP 错误: {error_msg}")
+                    last_data = json_str
+                    try:
+                        json_data = json.loads(json_str)
+                    except Exception:
+                        continue
 
-            # Extract content from result
-            result = json_data.get("result", {})
-            content = result.get("content", [])
-            if not content:
-                raise Exception("MCP 返回空内容")
+                    if isinstance(json_data, dict) and "error" in json_data:
+                        error_msg = json_data["error"].get("message", "未知错误")
+                        raise Exception(f"MCP 错误: {error_msg}")
 
-            # Get the text content
-            text = content[0].get("text", "")
-            if not text:
-                raise Exception("MCP 返回的 text 为空")
+                    if isinstance(json_data, dict) and "result" in json_data:
+                        return self._extract_markdown(json_data)
 
-            return text
+                raise Exception(f"MCP 未返回结果（最后一条 data: {str(last_data)[:120]}）")
+
+    @staticmethod
+    def _extract_markdown(json_data: dict) -> str:
+        if "error" in json_data:
+            error_msg = json_data["error"].get("message", "未知错误")
+            raise Exception(f"MCP 错误: {error_msg}")
+
+        result = json_data.get("result", {})
+        content = result.get("content", [])
+        if not content:
+            raise Exception("MCP 返回空内容")
+
+        text = content[0].get("text", "")
+        if not text:
+            raise Exception("MCP 返回的 text 为空")
+
+        return text

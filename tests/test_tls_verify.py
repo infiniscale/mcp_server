@@ -20,6 +20,7 @@ async def test_tls_verify_disabled(tmp_path):
         with patch("mcp_convert_router.url_downloader.httpx.AsyncClient") as mock_client_class:
             # Create mock client instance
             mock_client = AsyncMock()
+            mock_client.aclose = AsyncMock()
             mock_response = MagicMock()
             mock_response.status_code = 200
             mock_response.headers = {"content-type": "text/html"}
@@ -29,8 +30,8 @@ async def test_tls_verify_disabled(tmp_path):
                 yield b"test content"
 
             mock_response.aiter_bytes = mock_aiter_bytes
-            mock_client.get.return_value = mock_response
-            mock_client_class.return_value.__aenter__.return_value = mock_client
+            mock_client.get = AsyncMock(return_value=mock_response)
+            mock_client_class.return_value = mock_client
 
             # Attempt download
             url = "https://example.com/test.pdf"

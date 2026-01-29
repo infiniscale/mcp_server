@@ -43,6 +43,20 @@ PRIVATE_IP_RANGES = [
     ipaddress.ip_network("fe80::/10"),        # IPv6 link-local
 ]
 
+def _openwebui_self_callback_hint(url: str) -> str | None:
+    # OpenWebUI uploads are commonly served via `/api/v1/files/{id}/content`.
+    # If MCP is invoked from within OpenWebUI (Tool script) and then calls back
+    # into the same OpenWebUI to download the file, a single-worker / blocking
+    # OpenWebUI deployment can deadlock (OpenWebUI is busy waiting for MCP, so it
+    # can't serve the file download request).
+    if "/api/v1/files/" in url and url.rstrip("/").endswith("/content"):
+        return (
+            "提示：如果这是 OpenWebUI Tool → MCP → OpenWebUI 的回调下载，且 OpenWebUI 在执行 Tool 时是同步阻塞/单 worker，"
+            "可能会导致 OpenWebUI 无法并发处理 `/api/v1/files/.../content` 请求而形成自调用“死锁”。"
+            "请为 OpenWebUI 启用多 worker/线程，或改用 OpenWebUI 原生 MCP 集成。"
+        )
+    return None
+
 
 async def download_file_from_url(
     url: str,
@@ -126,114 +140,233 @@ async def download_file_from_url(
     try:
         # 准备请求头
         headers = custom_headers.copy() if custom_headers else {}
-        logger.info(f"[URL_DOWNLOAD] 准备 httpx 客户端, headers: {list(headers.keys())}")
+        logger.info(f"[URL_DOWNLOAD] 准备下载, headers: {list(headers.keys())}")
 
         # TLS 验证控制
         tls_verify_str = os.getenv("MCP_CONVERT_URL_TLS_VERIFY", "true").strip().lower()
         tls_verify = tls_verify_str not in ("false", "0", "no", "off")
         logger.info(f"[URL_DOWNLOAD] TLS 验证: {tls_verify}, 超时: connect={connect_timeout}s, read={read_timeout}s")
 
-        # 使用同步客户端在线程池中执行，避免 async 事件循环问题
-        def _sync_download():
-            """在线程池中执行同步下载，使用 urllib 替代 httpx"""
-            import threading
-            import urllib.request
-            import urllib.error
-            import ssl
+        download_impl = os.getenv("MCP_CONVERT_URL_DOWNLOADER", "httpx").strip().lower()
 
-            logger.info(f"[URL_DOWNLOAD] 线程池任务开始执行, thread={threading.current_thread().name}")
+        if download_impl != "urllib":
+            client = None
             try:
-                # 构建请求
-                req = urllib.request.Request(url, headers=headers)
-                logger.info(f"[URL_DOWNLOAD] 使用 urllib 发送请求: {url[:80]}...")
+                timeout = httpx.Timeout(connect=connect_timeout, read=read_timeout, write=60, pool=60)
+                client = httpx.AsyncClient(
+                    timeout=timeout,
+                    follow_redirects=True,
+                    verify=tls_verify,
+                    headers=headers,
+                    trust_env=False,
+                )
 
-                # SSL 上下文
-                ssl_context = None
-                if not tls_verify:
-                    ssl_context = ssl.create_default_context()
-                    ssl_context.check_hostname = False
-                    ssl_context.verify_mode = ssl.CERT_NONE
+                response = await client.get(url)
+                status_code = response.status_code
+                logger.info(f"[URL_DOWNLOAD] httpx 收到响应: {status_code}")
 
-                # 发送请求
-                with urllib.request.urlopen(req, timeout=read_timeout, context=ssl_context) as response:
-                    status_code = response.status
-                    logger.info(f"[URL_DOWNLOAD] urllib 收到响应: {status_code}")
-
-                    if status_code != 200:
-                        return {"error": "E_URL_HTTP_ERROR", "message": f"HTTP 错误: {status_code}"}
-
-                    # 读取内容
-                    content = response.read()
-                    response_headers = dict(response.headers)
-
-                    return {
-                        "ok": True,
-                        "content": content,
-                        "headers": response_headers,
-                        "final_url": response.url or url
-                    }
-
-            except urllib.error.HTTPError as e:
-                logger.error(f"[URL_DOWNLOAD] urllib HTTP 错误: {e.code}")
-                return {"error": "E_URL_HTTP_ERROR", "message": f"HTTP 错误: {e.code}"}
-            except urllib.error.URLError as e:
-                logger.error(f"[URL_DOWNLOAD] urllib URL 错误: {e.reason}")
-                return {"error": "E_URL_CONNECT_ERROR", "message": str(e.reason)}
-            except Exception as e:
-                logger.error(f"[URL_DOWNLOAD] 线程内异常: {type(e).__name__}: {e}")
-                return {"error": "E_URL_DOWNLOAD_FAILED", "message": str(e)}
-
-        # 在线程池中执行同步下载
-        logger.info(f"[URL_DOWNLOAD] 准备提交到线程池...")
-        loop = asyncio.get_event_loop()
-        sync_result = await loop.run_in_executor(None, _sync_download)
-        logger.info(f"[URL_DOWNLOAD] 线程池任务完成, result_keys={list(sync_result.keys())}")
-
-        if "error" in sync_result:
-            result["error_code"] = sync_result["error"]
-            result["error_message"] = sync_result["message"]
-        elif sync_result.get("ok"):
-            content = sync_result["content"]
-            response_headers = sync_result["headers"]
-            current_url = sync_result["final_url"]
-
-            # 从响应头提取文件名
-            content_disposition = response_headers.get("Content-Disposition", "")
-            filename = None
-            if content_disposition:
-                # 尝试 filename*= (RFC 5987)
-                match = re.search(r"filename\*=(?:UTF-8''|utf-8'')(.+?)(?:;|$)", content_disposition, re.IGNORECASE)
-                if match:
-                    from urllib.parse import unquote
-                    filename = unquote(match.group(1).strip())
+                if status_code != 200:
+                    result["error_code"] = "E_URL_HTTP_ERROR"
+                    result["error_message"] = f"HTTP 错误: {status_code}"
                 else:
-                    # 尝试 filename=
-                    match = re.search(r'filename=["\']?([^"\';\n]+)["\']?', content_disposition)
+                    filename = _extract_filename_from_response(response, str(response.url or url))
+                    output_path = input_dir / filename
+
+                    total_bytes = 0
+                    too_large = False
+                    with open(output_path, "wb") as f:
+                        chunks = response.aiter_bytes(chunk_size=64 * 1024)
+                        if hasattr(chunks, "__aiter__"):
+                            async for chunk in chunks:
+                                if not chunk:
+                                    continue
+                                total_bytes += len(chunk)
+                                if total_bytes > max_bytes:
+                                    too_large = True
+                                    break
+                                f.write(chunk)
+                        else:
+                            for chunk in chunks:
+                                if not chunk:
+                                    continue
+                                total_bytes += len(chunk)
+                                if total_bytes > max_bytes:
+                                    too_large = True
+                                    break
+                                f.write(chunk)
+
+                    if too_large:
+                        try:
+                            if output_path.exists():
+                                output_path.unlink()
+                        except Exception:
+                            pass
+                        result["error_code"] = "E_INPUT_TOO_LARGE"
+                        result["error_message"] = f"下载超过大小限制 {max_bytes / 1024 / 1024:.2f}MB"
+                    else:
+                        result["ok"] = True
+                        result["file_path"] = str(output_path)
+                        result["filename"] = filename
+                        result["size_bytes"] = total_bytes
+                        result["content_type"] = response.headers.get("content-type")
+                        logger.info(f"[URL_DOWNLOAD] 下载成功: {filename}, {total_bytes} bytes")
+
+            except httpx.TimeoutException:
+                hint = _openwebui_self_callback_hint(url)
+                msg = f"下载超时（连接: {connect_timeout}s, 读取: {read_timeout}s）"
+                if hint:
+                    msg += f"\n\n{hint}"
+                result["error_code"] = "E_TIMEOUT"
+                result["error_message"] = msg
+            except httpx.ConnectError as e:
+                result["error_code"] = "E_URL_CONNECT_ERROR"
+                result["error_message"] = f"连接失败: {str(e)}"
+            except httpx.RequestError as e:
+                result["error_code"] = "E_URL_DOWNLOAD_FAILED"
+                result["error_message"] = f"请求失败: {str(e)}"
+            finally:
+                if client is not None:
+                    try:
+                        await client.aclose()
+                    except Exception:
+                        pass
+        else:
+            # 使用同步客户端下载：在线程池中执行，避免 async 事件循环问题
+            def _sync_download():
+                """在线程池中执行同步下载，使用 urllib 替代 httpx"""
+                import threading
+                import urllib.request
+                import urllib.error
+                import ssl
+                import socket as socket_mod
+                from urllib.parse import urlparse
+
+                logger.info(f"[URL_DOWNLOAD] 线程池任务开始执行, thread={threading.current_thread().name}")
+                try:
+                    # 预连接探测：把 connect_timeout 与 read_timeout 分开观测（urllib 的 timeout 不区分 connect/read）
+                    parsed_url = urlparse(url)
+                    hostname = parsed_url.hostname
+                    port = parsed_url.port or (443 if parsed_url.scheme == "https" else 80)
+                    if hostname:
+                        t0 = time.time()
+                        try:
+                            sock = socket_mod.create_connection((hostname, port), timeout=connect_timeout)
+                            sock.close()
+                            logger.info(
+                                f"[URL_DOWNLOAD] TCP connect OK: {hostname}:{port}, elapsed_ms={int((time.time()-t0)*1000)}"
+                            )
+                        except Exception as e:
+                            hint = _openwebui_self_callback_hint(url)
+                            msg = f"TCP 连接失败: {hostname}:{port}: {e}"
+                            if hint:
+                                msg += f"\n\n{hint}"
+                            return {"error": "E_URL_CONNECT_ERROR", "message": msg}
+
+                    # 构建请求
+                    req = urllib.request.Request(url, headers=headers)
+                    logger.info(f"[URL_DOWNLOAD] 使用 urllib 发送请求: {url[:80]}...")
+
+                    # SSL 上下文
+                    ssl_context = None
+                    if not tls_verify:
+                        ssl_context = ssl.create_default_context()
+                        ssl_context.check_hostname = False
+                        ssl_context.verify_mode = ssl.CERT_NONE
+
+                    # 发送请求
+                    with urllib.request.urlopen(req, timeout=read_timeout, context=ssl_context) as response:
+                        status_code = response.status
+                        logger.info(f"[URL_DOWNLOAD] urllib 收到响应: {status_code}")
+
+                        if status_code != 200:
+                            return {"error": "E_URL_HTTP_ERROR", "message": f"HTTP 错误: {status_code}"}
+
+                        # 读取内容
+                        content = response.read()
+                        response_headers = dict(response.headers)
+
+                        return {
+                            "ok": True,
+                            "content": content,
+                            "headers": response_headers,
+                            "final_url": response.url or url
+                        }
+
+                except urllib.error.HTTPError as e:
+                    logger.error(f"[URL_DOWNLOAD] urllib HTTP 错误: {e.code}")
+                    return {"error": "E_URL_HTTP_ERROR", "message": f"HTTP 错误: {e.code}"}
+                except urllib.error.URLError as e:
+                    if isinstance(getattr(e, "reason", None), (TimeoutError, socket_mod.timeout)):
+                        hint = _openwebui_self_callback_hint(url)
+                        msg = f"下载超时: {e.reason}"
+                        if hint:
+                            msg += f"\n\n{hint}"
+                        logger.error(f"[URL_DOWNLOAD] urllib 超时: {e.reason}")
+                        return {"error": "E_TIMEOUT", "message": msg}
+                    logger.error(f"[URL_DOWNLOAD] urllib URL 错误: {e.reason}")
+                    return {"error": "E_URL_CONNECT_ERROR", "message": str(e.reason)}
+                except (TimeoutError, socket_mod.timeout) as e:
+                    hint = _openwebui_self_callback_hint(url)
+                    msg = f"下载超时: {e}"
+                    if hint:
+                        msg += f"\n\n{hint}"
+                    logger.error(f"[URL_DOWNLOAD] urllib 超时: {e}")
+                    return {"error": "E_TIMEOUT", "message": msg}
+                except Exception as e:
+                    logger.error(f"[URL_DOWNLOAD] 线程内异常: {type(e).__name__}: {e}")
+                    return {"error": "E_URL_DOWNLOAD_FAILED", "message": str(e)}
+
+            # 在线程池中执行同步下载
+            logger.info(f"[URL_DOWNLOAD] 准备提交到线程池...")
+            loop = asyncio.get_event_loop()
+            sync_result = await loop.run_in_executor(None, _sync_download)
+            logger.info(f"[URL_DOWNLOAD] 线程池任务完成, result_keys={list(sync_result.keys())}")
+
+            if "error" in sync_result:
+                result["error_code"] = sync_result["error"]
+                result["error_message"] = sync_result["message"]
+            elif sync_result.get("ok"):
+                content = sync_result["content"]
+                response_headers = sync_result["headers"]
+                current_url = sync_result["final_url"]
+
+                # 从响应头提取文件名
+                content_disposition = response_headers.get("Content-Disposition", "")
+                filename = None
+                if content_disposition:
+                    # 尝试 filename*= (RFC 5987)
+                    match = re.search(r"filename\*=(?:UTF-8''|utf-8'')(.+?)(?:;|$)", content_disposition, re.IGNORECASE)
                     if match:
-                        filename = match.group(1).strip()
+                        from urllib.parse import unquote
+                        filename = unquote(match.group(1).strip())
+                    else:
+                        # 尝试 filename=
+                        match = re.search(r'filename=["\']?([^"\';\n]+)["\']?', content_disposition)
+                        if match:
+                            filename = match.group(1).strip()
 
-            if not filename:
-                # 从 URL 提取
-                path = urlparse(current_url).path
-                filename = path.split("/")[-1] if path else "downloaded_file"
+                if not filename:
+                    # 从 URL 提取
+                    path = urlparse(current_url).path
+                    filename = path.split("/")[-1] if path else "downloaded_file"
 
-            output_path = input_dir / filename
+                output_path = input_dir / filename
 
-            # 检查大小
-            total_bytes = len(content)
-            if total_bytes > max_bytes:
-                result["error_code"] = "E_INPUT_TOO_LARGE"
-                result["error_message"] = f"下载超过大小限制 {max_bytes / 1024 / 1024:.2f}MB"
-            else:
-                with open(output_path, "wb") as f:
-                    f.write(content)
+                # 检查大小
+                total_bytes = len(content)
+                if total_bytes > max_bytes:
+                    result["error_code"] = "E_INPUT_TOO_LARGE"
+                    result["error_message"] = f"下载超过大小限制 {max_bytes / 1024 / 1024:.2f}MB"
+                else:
+                    with open(output_path, "wb") as f:
+                        f.write(content)
 
-                result["ok"] = True
-                result["file_path"] = str(output_path)
-                result["filename"] = filename
-                result["size_bytes"] = total_bytes
-                result["content_type"] = response_headers.get("Content-Type")
-                logger.info(f"[URL_DOWNLOAD] 下载成功: {filename}, {total_bytes} bytes")
+                    result["ok"] = True
+                    result["file_path"] = str(output_path)
+                    result["filename"] = filename
+                    result["size_bytes"] = total_bytes
+                    result["content_type"] = response_headers.get("Content-Type")
+                    logger.info(f"[URL_DOWNLOAD] 下载成功: {filename}, {total_bytes} bytes")
 
     except httpx.TimeoutException:
         result["error_code"] = "E_TIMEOUT"

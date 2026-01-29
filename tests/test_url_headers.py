@@ -16,7 +16,7 @@ async def test_url_headers_in_schema():
 import httpx
 from mcp_convert_router.url_downloader import download_file_from_url
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 
 @pytest.mark.asyncio
 async def test_download_sends_custom_headers():
@@ -29,10 +29,9 @@ async def test_download_sends_custom_headers():
     mock_response.aiter_bytes = lambda chunk_size: iter([b"test content"])
 
     # Mock client
-    mock_client = MagicMock()
-    mock_client.__aenter__ = lambda self: mock_client
-    mock_client.__aexit__ = lambda self, *args: None
-    mock_client.get = MagicMock(return_value=mock_response)
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=mock_response)
+    mock_client.aclose = AsyncMock()
 
     with patch('httpx.AsyncClient', return_value=mock_client) as mock_async_client:
         work_dir = Path("/tmp/test_work")

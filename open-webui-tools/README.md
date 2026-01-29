@@ -32,7 +32,10 @@
 
 在 Tool 的 Valves 配置中，可以修改：
 
+- **mcp_url**: MCP Convert Router 的 JSON-RPC 地址（例如 `http://mcp:25081/mcp/`）
 - **openwebui_base_url**: OpenWebUI 的基础 URL（默认：`http://192.168.1.236:22030`）
+- **openwebui_api_key**: （可选）OpenWebUI API Key（当 `__user__.token` 不存在时使用）
+- **timeout_seconds**: Tool 等待 MCP 处理的超时时间（默认 600 秒）
 
 ## 使用方法
 
@@ -116,6 +119,17 @@ MCP 服务：
 **解决**：
 - 检查 MCP 服务状态：`docker logs mcp-convert-router`
 - 检查 mcpo 代理状态：`docker logs mcpo`
+
+### 问题：下载超时（600s）——MCP 回调 OpenWebUI 时卡住
+
+**现象**：通过 OpenWebUI Tool 调用 MCP 后，MCP 需要再访问 `OpenWebUI /api/v1/files/{id}/content` 下载文件，但一直超时。
+
+**根因（常见）**：调用链是「OpenWebUI（执行 Tool）→ MCP → OpenWebUI（文件下载）」。如果 OpenWebUI 在执行 Tool 时占用了同一个 worker/事件循环（同步阻塞），就会导致 OpenWebUI 无法并发处理文件下载请求，从而形成“自调用死锁”。
+
+**解决**：
+- 优先用 OpenWebUI 原生 MCP（见 `docs/openwebui/README.md`），避免 Tool 脚本同步阻塞 OpenWebUI。
+- 或者把 OpenWebUI 配置为可并发处理请求（例如多 worker / 多线程），保证 Tool 执行期间 `/api/v1/files/.../content` 仍可被访问。
+- 使用本仓库 `file_to_markdown.py` v2.1.0+（`convert_file` 为 async），减少阻塞概率（取决于 OpenWebUI Tool 运行方式）。
 
 ## 相关文档
 
