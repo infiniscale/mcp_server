@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 class Tools:
     class Valves(BaseModel):
         mcp_url: str = Field(
-            default="http://211.93.0.206:10029/mcp/",
+            default="http://<MCP_SERVER_HOST>:<MCP_SERVER_PORT>/mcp/",
             description="MCP Convert Router server URL (JSON-RPC endpoint)"
         )
         upload_dir: str = Field(

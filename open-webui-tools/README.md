@@ -2,6 +2,18 @@
 
 这个目录包含用于 OpenWebUI 的 Tool 脚本，用于与 MCP Convert Router 服务集成。
 
+## 快速示例
+
+安装 Tool 后，在 OpenWebUI 中这样使用：
+
+```
+用户：[上传 document.pdf] 请把这个文件转成 Markdown
+AI：[调用 file_to_markdown]
+    转换完成：
+    # 文档标题
+    ...
+```
+
 ## 文件列表
 
 | 文件 | 功能 |
@@ -33,8 +45,8 @@
 
 在 Tool 的 Valves 配置中，可以修改：
 
-- **mcp_url**: MCP Convert Router 的 JSON-RPC 地址（例如 `http://mcp:25081/mcp/`）
-- **openwebui_base_url**: OpenWebUI 的基础 URL（默认：`http://192.168.1.236:22030`）
+- **mcp_url**: MCP Convert Router 的 JSON-RPC 地址（例如 `http://<MCP_IP>:<PORT>/mcp/`）
+- **openwebui_base_url**: OpenWebUI 的基础 URL（例如 `http://<OPENWEBUI_IP>:<PORT>`）
 - **openwebui_api_key**: （可选）OpenWebUI API Key（当 `__user__.token` 不存在时使用）
 - **timeout_seconds**: Tool 等待 MCP 处理的超时时间（默认 600 秒）
 
@@ -138,7 +150,7 @@ MCP 服务：
 **解决**：
 - 优先用 OpenWebUI 原生 MCP（见 `docs/openwebui/README.md`），避免 Tool 脚本同步阻塞 OpenWebUI。
 - 或者把 OpenWebUI 配置为可并发处理请求（例如多 worker / 多线程），保证 Tool 执行期间 `/api/v1/files/.../content` 仍可被访问。
-- 使用本仓库 `file_to_markdown.py` v2.1.0+（`convert_file` 为 async），减少阻塞概率（取决于 OpenWebUI Tool 运行方式）。
+- 使用本仓库 `file_to_markdown.py` v2.3.0+（`convert_file` 为 async），减少阻塞概率（取决于 OpenWebUI Tool 运行方式）。
 
 ### 问题：工具执行成功，但聊天回复里看不到结果
 
