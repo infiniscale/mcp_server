@@ -48,10 +48,11 @@
 
 1. **上传文件**：在 OpenWebUI 对话界面上传文件（PDF、DOCX、图片等）
 
-2. **调用 Tool**：告诉 LLM 转换文件，例如：
+2. **调用 Tool**：直接告诉 LLM 转换“刚上传的文件”即可（无需手动查 file_id），例如：
    ```
-   请使用 prepare_file_for_conversion 工具准备文件转换，file_id 是 xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx（从当前对话附件中复制）
+   请使用 File to Markdown Converter 工具把我刚上传的文件转换成 Markdown
    ```
+   如果一次上传了多个文件，工具会依次转换并把结果按文件名分段返回。
 
 3. **LLM 自动调用 MCP**：Tool 会返回调用指令，LLM 会自动调用 `convert_to_markdown` 工具完成转换
 

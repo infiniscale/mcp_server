@@ -2,14 +2,14 @@
 title: File to Markdown Converter
 author: MCP Convert Router Team
 author_url: https://github.com/infiniscale/mcp_server
-version: 2.1.1
+version: 2.2.0
 license: MIT
 description: Convert files to Markdown using MCP Convert Router service (via URL)
 requirements: httpx
 """
 
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Any, Optional
 import json
 import uuid
 import httpx
@@ -40,10 +40,13 @@ class Tools:
 
     async def convert_file(
         self,
-        file_id: str,
+        file_id: str = "",
         enable_ocr: bool = False,
         language: str = "ch",
-        __user__: Optional[dict] = None
+        __user__: Optional[dict] = None,
+        __files__: Optional[list] = None,
+        __oauth_token__: Optional[dict] = None,
+        __event_emitter__: Any = None,
     ) -> str:
         """
         Convert uploaded files to Markdown format via URL download.
@@ -53,52 +56,55 @@ class Tools:
         - User asks to convert, extract, or read the file
         - User wants to see the file content
 
-        IMPORTANT: The file_id is the UUID of the uploaded file.
-        You can find it in the file metadata. For example:
-        - If user uploaded a file, look for the file's id/uuid in the conversation context
-        - The file_id looks like: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-        - DO NOT pass Chinese text or descriptions as file_id
+        IMPORTANT:
+        - You do NOT need to provide file_id manually.
+        - This tool will use __files__ (the current message attachments) as the source of truth.
+        - If multiple files are attached, it will convert all of them.
 
-        :param file_id: The UUID of the uploaded file (e.g., "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
+        :param file_id: (Optional) A file UUID. Ignored when __files__ is present.
         :param enable_ocr: Enable OCR for scanned documents or images (default: False)
         :param language: OCR language - "ch" for Chinese, "en" for English (default: "ch")
         :return: The file content in Markdown format
         """
 
         try:
-            print(f"[FileToMD-URL] Converting file {file_id}")
-
-            # Validate file_id
-            file_id = (file_id or "").strip()
-            try:
-                file_id = str(uuid.UUID(file_id))
-            except Exception:
-                return "错误：无效的 file_id。请从当前对话的附件信息中复制文件 UUID（形如 xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx）。"
-
-            # Construct file URL
             openwebui_base = self.valves.openwebui_base_url.rstrip("/")
-            file_url = f"{openwebui_base}/api/v1/files/{file_id}/content"
-            print(f"[FileToMD-URL] File URL: {file_url}")
 
-            # Get user token for authentication
-            user_token = ""
-            if __user__ and isinstance(__user__, dict):
-                user_token = __user__.get("token", "")
-            print(f"[FileToMD-URL] User token available: {bool(user_token)}")
+            file_infos = self._extract_file_infos(__files__)
 
-            # Build url_headers
-            url_headers = {}
-            if user_token:
-                url_headers["Authorization"] = f"Bearer {user_token}"
-            elif self.valves.openwebui_api_key:
-                url_headers["Authorization"] = f"Bearer {self.valves.openwebui_api_key}"
+            if not file_infos:
+                # Backward compatibility: allow explicit file_id when __files__ isn't available.
+                candidate = (file_id or "").strip()
+                try:
+                    candidate = str(uuid.UUID(candidate))
+                except Exception:
+                    return "错误：未检测到附件文件。请先在对话里上传文件后再调用本工具。"
+                file_infos = [{"id": candidate, "name": candidate}]
 
-            # Call MCP
-            print(f"[FileToMD-URL] Calling MCP at {self.valves.mcp_url}...")
-            markdown = await self._call_mcp(file_url, url_headers, enable_ocr, language)
-            print(f"[FileToMD-URL] Success, got {len(markdown)} chars")
+            url_headers = self._build_url_headers(__user__, __oauth_token__)
 
-            return markdown
+            results: list[str] = []
+            total = len(file_infos)
+            for idx, info in enumerate(file_infos, start=1):
+                current_id = info["id"]
+                name = info.get("name") or current_id
+                await self._emit_status(__event_emitter__, f"开始转换 ({idx}/{total}): {name}")
+
+                file_url = f"{openwebui_base}/api/v1/files/{current_id}/content"
+                print(f"[FileToMD-URL] File URL: {file_url}")
+
+                try:
+                    markdown = await self._call_mcp(file_url, url_headers, enable_ocr, language)
+                    results.append(f"# {name}\n\n{markdown}\n")
+                    await self._emit_status(__event_emitter__, f"转换完成 ({idx}/{total}): {name}")
+                except Exception as e:
+                    results.append(f"# {name}\n\n转换失败: {str(e)}\n")
+                    await self._emit_status(__event_emitter__, f"转换失败 ({idx}/{total}): {name}")
+
+            if len(results) == 1:
+                return results[0]
+
+            return "\n---\n\n".join(results)
 
         except Exception as e:
             error_msg = f"转换失败: {str(e)}"
@@ -106,6 +112,73 @@ class Tools:
             import traceback
             traceback.print_exc()
             return error_msg
+
+    @staticmethod
+    async def _emit_status(event_emitter: Any, message: str) -> None:
+        if not callable(event_emitter):
+            return
+        try:
+            payload = {"type": "status", "data": {"message": message}}
+            maybe_awaitable = event_emitter(payload)
+            if hasattr(maybe_awaitable, "__await__"):
+                await maybe_awaitable
+        except Exception:
+            return
+
+    def _build_url_headers(self, user: Optional[dict], oauth_token: Optional[dict]) -> dict:
+        # Prefer OAuth access token when available.
+        if oauth_token and isinstance(oauth_token, dict):
+            access_token = (oauth_token.get("access_token") or "").strip()
+            if access_token:
+                return {"Authorization": f"Bearer {access_token}"}
+
+        # Fallback: OpenWebUI may inject a token in __user__ for some auth modes.
+        if user and isinstance(user, dict):
+            user_token = (user.get("token") or "").strip()
+            if user_token:
+                return {"Authorization": f"Bearer {user_token}"}
+
+        # Fallback: static API key via tool valve.
+        if (self.valves.openwebui_api_key or "").strip():
+            return {"Authorization": f"Bearer {self.valves.openwebui_api_key.strip()}"}
+
+        return {}
+
+    @staticmethod
+    def _extract_file_infos(files: Optional[list]) -> list[dict]:
+        infos: list[dict] = []
+
+        if not files or not isinstance(files, list):
+            return infos
+
+        for item in files:
+            if not isinstance(item, dict):
+                continue
+
+            # Common OpenWebUI shape:
+            # {"type":"file","file":{...,"id":...,"filename":...,"meta":{"name":...}},"id":...,"name":...}
+            file_obj = item.get("file") if isinstance(item.get("file"), dict) else {}
+
+            candidate_id = (
+                file_obj.get("id")
+                or item.get("id")
+                or item.get("file_id")
+            )
+            candidate_name = (
+                file_obj.get("filename")
+                or (file_obj.get("meta") or {}).get("name")
+                or item.get("name")
+                or item.get("filename")
+            )
+
+            try:
+                file_uuid = str(uuid.UUID(str(candidate_id).strip()))
+            except Exception:
+                continue
+
+            infos.append({"id": file_uuid, "name": str(candidate_name) if candidate_name else file_uuid})
+
+        return infos
 
     async def _call_mcp(self, file_url: str, url_headers: dict, enable_ocr: bool, language: str) -> str:
         """Call MCP Convert Router service via JSON-RPC with URL source"""
